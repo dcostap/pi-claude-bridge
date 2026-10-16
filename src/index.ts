@@ -4,7 +4,7 @@ import { buildSessionContext, keyHint, type ExtensionAPI, type ExtensionContext,
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
-import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
+import { createSession, deleteSession, getSessionPath, normalizeProjectPath, openSession, repairToolPairing } from "cc-session-io";
 import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
@@ -12,6 +12,7 @@ import { debugLogPath, diagLogPath } from "./log-paths.js";
 import { applyLongContext, buildModels, claudeCodeModelId, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
+import { forkSessionPrefix, historyFingerprint, type ForkPoint } from "./session-fork.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, ctx } from "./query-state.js";
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
@@ -202,6 +203,12 @@ interface SessionState {
 	// with no query in flight does NOT set this — there's no concurrent CC writer
 	// then, so in-place rebuild (preserve UUID, deleteSession + createSession) is safe.
 	forceRotate?: boolean;
+	// Set by an abort when the aborted query resumed a session file. The next
+	// sync cuts that file back to where the query started, under a new id, and
+	// appends what pi kept of the aborted turn. Unlike REBUILD this keeps CC's
+	// own records, so the prompt cache survives. Used once; on a mismatch with
+	// pi's history the sync falls back to REBUILD.
+	forkPoint?: ForkPoint & { cwd: string };
 }
 
 /**
@@ -296,7 +303,10 @@ function markRebuildForSession(piSession: string | null, event: string): void {
 	if (!state) {
 		debug(`${event}: history rewritten, no session to mark yet`);
 	} else {
-		sharedSessions.set(key, { ...state, needsRebuild: true });
+		// A compaction replaces the start of pi's history, so a cut of the CC file
+		// can never match it. The fork point's fingerprint would catch this too.
+		const forkPoint = event.startsWith("session_compact") ? undefined : state.forkPoint;
+		sharedSessions.set(key, { ...state, needsRebuild: true, forkPoint });
 		debug(`${event}: marking needsRebuild on session ${state.sessionId.slice(0, 8)}`);
 	}
 	// Arming parked contexts cannot wait for delivery: the entry checks
@@ -760,9 +770,18 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	// every read and write below addresses sessionStateFor(piSessionId), so a
 	// foreign session's shape-matching context can never REUSE or rebuild another
 	// session's CC file.
-	const sharedSession = sessionStateFor(piSessionId);
+	let sharedSession = sessionStateFor(piSessionId);
 	const history = nonSystemMessages(messages);
 	const priorMessages = history.slice(0, turnStart(history)); // everything before the current user turn
+
+	// FORK path: the last query was aborted. Takes precedence over needsRebuild,
+	// which the abort also set as the fallback.
+	if (sharedSession?.forkPoint) {
+		const forked = syncFromForkPoint(sharedSession.forkPoint, priorMessages, cwd, customToolNameToSdk, modelId, piSessionId);
+		if (forked) return forked;
+		sharedSession = { ...sharedSession, forkPoint: undefined };
+		setSessionStateFor(piSessionId, sharedSession);
+	}
 
 	// REUSE path
 	//
@@ -850,6 +869,61 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	debugSessionPaths(`${session.sessionId.slice(0, 8)}`, cwd, session.jsonlPath);
 	debug(`syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} ${previousSessionId === undefined ? "first" : preserveId ? "preserved" : "rotated-post-abort"}`);
 	return { sessionId: session.sessionId };
+}
+
+/** Cut the aborted query's session file back to where the query started, and
+ *  append pi's record of the aborted turn. Null when pi's history no longer
+ *  starts with what the file holds, or the file cannot be cut: the caller then
+ *  rebuilds as before. */
+function syncFromForkPoint(
+	point: ForkPoint & { cwd: string },
+	priorMessages: Context["messages"],
+	cwd: string,
+	customToolNameToSdk: Map<string, string> | undefined,
+	modelId: string | undefined,
+	piSessionId: string | null | undefined,
+): SyncResult | null {
+	const label = `fork from ${point.sessionId.slice(0, 8)}@${point.bytes}`;
+	if (point.cwd !== cwd) {
+		debug(`${label}: cwd changed (${point.cwd} → ${cwd}), rebuilding instead`);
+		return null;
+	}
+	if (priorMessages.length < point.piTurnStart || historyFingerprint(priorMessages, point.piTurnStart) !== point.fingerprint) {
+		debug(`${label}: pi history no longer starts with the ${point.piTurnStart} messages the file holds, rebuilding instead`);
+		return null;
+	}
+	let session: ReturnType<typeof forkSessionPrefix>;
+	try {
+		session = forkSessionPrefix({ sourceSessionId: point.sessionId, bytes: point.bytes, cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR, model: modelId });
+	} catch (error) {
+		debug(`${label}: could not cut the session file, rebuilding instead:`, error);
+		return null;
+	}
+	const prefixRecords = session.records.length;
+	convertAndImportMessages(session, priorMessages.slice(point.piTurnStart), customToolNameToSdk);
+	session.save();
+	verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd);
+	setSessionStateFor(piSessionId, { sessionId: session.sessionId, cursor: priorMessages.length, cwd, piSessionId: piSessionId ?? undefined });
+	debug(`Case 5 post-abort fork: ${label} → new session ${session.sessionId.slice(0, 8)}, ${prefixRecords} records kept + ${session.records.length - prefixRecords} for ${priorMessages.length - point.piTurnStart} pi messages`);
+	debugSessionPaths(`${session.sessionId.slice(0, 8)}`, cwd, session.jsonlPath);
+	debug(`syncResult: path=fork sessionId=${session.sessionId} priors=${priorMessages.length}`);
+	return { sessionId: session.sessionId };
+}
+
+/** Where a query that resumes `sessionId` starts, for syncFromForkPoint after
+ *  an abort. Null when there is no file to cut back to. */
+function forkPointAt(sessionId: string | null, cwd: string, messages: Context["messages"]): (ForkPoint & { cwd: string }) | null {
+	if (!sessionId) return null;
+	const history = nonSystemMessages(messages);
+	const piTurnStart = turnStart(history);
+	if (piTurnStart === 0) return null;
+	try {
+		const bytes = statSync(getSessionPath(sessionId, normalizeProjectPath(cwd), process.env.CLAUDE_CONFIG_DIR)).size;
+		return { sessionId, bytes, piTurnStart, fingerprint: historyFingerprint(history, piTurnStart), cwd };
+	} catch (error) {
+		debug(`forkPointAt: no session file for ${sessionId.slice(0, 8)}:`, error);
+		return null;
+	}
 }
 
 // The SDK's query(), or a test double (see setQuery).
@@ -1958,6 +2032,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// armed rewrite — a sibling pi session's stays armed for its own queries.
 	if (piSessionId) historyRewrittenBySession.delete(piSessionId);
 	const { sessionId: resumeSessionId } = syncResult;
+	// Before the query starts: CC appends to the resumed file from here on.
+	const forkPoint = syncResult.preserveSharedSession ? null : forkPointAt(resumeSessionId, cwd, context.messages);
 	const promptBlocks = extractUserPromptBlocks(context.messages);
 	let promptText = extractUserPrompt(context.messages) ?? "";
 
@@ -2108,10 +2184,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			// --- Abort detection in normal completion path ---
 			if (wasAborted || options?.signal?.aborted) {
 				// The killed subprocess may flush a late record into this session's
-				// JSONL — its own mirror's next sync must rebuild and rotate.
+				// JSONL — its own mirror's next sync must fork or rebuild, and rotate.
 				const state = sessionStateFor(queryCtx.piSessionId);
-				if (state) setSessionStateFor(queryCtx.piSessionId, { ...state, needsRebuild: true, forceRotate: true });
-				debug(`provider: abort detected, marked sharedSession needsRebuild + forceRotate`);
+				if (state) setSessionStateFor(queryCtx.piSessionId, { ...state, needsRebuild: true, forceRotate: true, forkPoint: forkPoint ?? undefined });
+				debug(`provider: abort detected, marked sharedSession needsRebuild + forceRotate${forkPoint ? ` + forkPoint ${forkPoint.sessionId.slice(0, 8)}@${forkPoint.bytes}` : ""}`);
 				if (queryCtx.turnOutput) {
 					queryCtx.turnOutput.stopReason = "aborted";
 					queryCtx.turnOutput.errorMessage = "Operation aborted";
@@ -2161,7 +2237,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			}
 			if ((wasAborted || options?.signal?.aborted)) {
 				const state = sessionStateFor(queryCtx.piSessionId);
-				if (state) setSessionStateFor(queryCtx.piSessionId, { ...state, needsRebuild: true, forceRotate: true });
+				if (state) setSessionStateFor(queryCtx.piSessionId, { ...state, needsRebuild: true, forceRotate: true, forkPoint: forkPoint ?? undefined });
 				queryCtx.heldRateLimit = undefined;
 			} else {
 				// Drop this session's mirror: its conversation is in an unknown
