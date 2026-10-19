@@ -61,6 +61,8 @@ export type LongContextSettings = {
 	// Model ids whose declared 1M context Claude Code turned out not to serve;
 	// forces bare id at 200K without a code change.
 	forceTwoHundredK?: string[];
+	// Upper limit for the registered contextWindow only (provider.contextWindow).
+	contextWindow?: number;
 };
 
 export type ClaudeCodeRuntimeModel = {
@@ -152,13 +154,18 @@ function newestPartialMatch<T extends { id: string }>(candidates: T[]): T | unde
 // match the window the bridge actually requests from Claude Code, or pi's status
 // bar and auto-compaction threshold will misreport. The runtime policy is based
 // on measured SDK behavior - see diag/CONTEXT-SIZE.md
+//
+// settings.contextWindow lowers the registered window below the requested one, so
+// pi compacts earlier. The reverse is unsafe: past the requested window, Claude
+// Code rejects the turn. The 1M label names the requested window.
 export function applyLongContext<T extends { id: string; name: string; contextWindow?: number | null }>(
 	models: T[],
 	settings: LongContextSettings,
 ): T[] {
 	return models.map((m) => {
-		const { contextWindow } = resolveClaudeCodeRuntimeModel(m, settings);
-		const name = contextWindow > TWO_HUNDRED_K_CONTEXT && !/\b1M\b/i.test(m.name) ? `${m.name} 1M` : m.name;
+		const requested = resolveClaudeCodeRuntimeModel(m, settings).contextWindow;
+		const contextWindow = settings.contextWindow ? Math.min(requested, settings.contextWindow) : requested;
+		const name = requested > TWO_HUNDRED_K_CONTEXT && !/\b1M\b/i.test(m.name) ? `${m.name} 1M` : m.name;
 		return contextWindow === m.contextWindow && name === m.name ? m : { ...m, contextWindow, name };
 	});
 }

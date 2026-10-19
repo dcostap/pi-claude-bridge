@@ -37,6 +37,10 @@ export interface Config {
 		// Model ids (e.g. "claude-future-9") whose declared 1M context Claude Code
 		// does not actually serve; pins them to the bare id at 200K.
 		forceTwoHundredK?: string[];
+		// Upper limit for the context window registered with pi, in tokens. pi's
+		// status bar and auto-compaction threshold use it. Claude Code still
+		// requests the model's full window.
+		contextWindow?: number;
 	};
 }
 

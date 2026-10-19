@@ -2503,10 +2503,14 @@ export default function (pi: ExtensionAPI) {
 	const forceTwoHundredK = Array.isArray(providerSettings.forceTwoHundredK)
 		? providerSettings.forceTwoHundredK.filter((id): id is string => typeof id === "string")
 		: undefined;
+	const contextWindow = Number.isInteger(providerSettings.contextWindow) && providerSettings.contextWindow! > 0
+		? providerSettings.contextWindow
+		: undefined;
 	longContextSettings = {
 		plan: providerSettings.plan ?? "pro",
 		longContextExtraUsage: providerSettings.longContextExtraUsage ?? false,
 		forceTwoHundredK,
+		contextWindow,
 	};
 	const registeredModels = applyLongContext(MODELS, longContextSettings);
 	if (registeredModels.length === 0) {

@@ -188,6 +188,15 @@ describe("applyLongContext", () => {
 		const extra = applyLongContext(models, EXTRA);
 		assert.equal(find(extra, "claude-sonnet-4-6").name, "Claude Sonnet 4.6 1M");
 	});
+
+	it("contextWindow lowers the registered window but not the requested one", () => {
+		const capped = { ...MAX, contextWindow: 300000 };
+		const registered = applyLongContext(models, capped);
+		assert.equal(find(registered, "claude-opus-5-5").contextWindow, 300000);
+		assert.equal(find(registered, "claude-opus-5-5").name, "Claude Opus 5.5 1M");
+		assert.equal(find(registered, "claude-sonnet-4-5").contextWindow, 200000);
+		assert.equal(claudeCodeModelId({ id: "claude-opus-5-5" }, capped), "claude-opus-5-5[1m]");
+	});
 });
 
 it("claude-opus-5-5 requests 1M on Pro", () => {
