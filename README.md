@@ -73,6 +73,7 @@ Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config direc
 - `longContextExtraUsage` — set to `true` to enable 1M context models even if they cost money through Extra Usage on your plan. It enables Sonnet 4.6 with 1M on every plan and Opus 4.6 with 1M on Pro. Not needed for Opus 4.7 or 4.8.
 - `forceTwoHundredK` — array of model ids to pin to 200K context (bare id, no `[1m]` suffix). Use if pi-ai declares a model at 1M but Claude Code won't serve it on your plan.
 - `contextWindow` — upper limit, in tokens, for the context window the bridge reports to pi (for example `300000`). pi's status bar and auto-compaction use it, so pi compacts at this value minus `compaction.reserveTokens` (default 16384). Claude Code still requests the model's full window, so a turn that goes past the limit does not fail.
+- `cachedCompaction` — write compaction summaries from the prompt cache (default `true`). See [Compaction and branch summaries](#compaction-and-branch-summaries).
 - `strictMcpConfig` — block MCP servers from `~/.claude.json` / `.mcp.json` (default `true`). Cloud MCP (Gmail/Drive via claude.ai OAuth) is always blocked.
 - `autoMemoryEnabled` — enable Claude Code's auto-memory system (default `false`)
 - `pathToClaudeCodeExecutable` — path to the `claude` binary. Useful if your OS/filesystem has the SDK's bundled musl/glibc binaries in a place where they can't run. For example, with Nix you can set the binary to e.g. `"/home/you/.nix-profile/bin/claude"`.
@@ -129,6 +130,18 @@ Hooks do not fire on isolated summary queries.
 ### Compaction and branch summaries
 
 pi runs compaction and branch summaries natively. The bridge routes their `cacheRetention: "none"` calls to isolated Claude Code queries, leaving the live session untouched until pi completes the history rewrite. Other extensions can provide summaries through pi's hooks.
+
+**Cached compaction summaries.** pi's own summary sends the summarized messages again as one new, uncached prompt. When the conversation is still in the prompt cache, the bridge instead resumes a copy of Claude Code's session file with the last turn's exact options (model, system prompt, tools, effort) and asks for the summary as the next user message. The conversation is then read from the cache at a tenth of the input price, and only the request itself is written. When the cut falls inside a turn, pi's own call still summarizes the start of that turn: it is shown exactly that span, which a model reading the whole conversation does not reliably keep to. The copy is deleted afterwards, and the live session is not changed.
+
+The bridge records a checkpoint after each answer and uses pi's path instead when any of these is true:
+
+- the cache has likely expired (its lifetime, read from Claude Code's usage, minus 30 seconds)
+- the summary model is not the conversation's model, or pi's branch no longer starts with the checkpointed conversation (for example after a tree navigation)
+- the session file changed since the checkpoint
+- the compaction recovers from a context overflow, or the request would not fit the context window
+- pi's summary is estimated to cost less, which happens when only a small part of a long conversation is summarized
+
+Messages pi added after the checkpoint go into the request as text. If the cached query fails, the bridge shows a warning and pi's path writes the summary. Set `provider.cachedCompaction` to `false` to always use pi's path. `diag/probe-cached-compact.mjs` measures both paths against the live API.
 
 ### System prompt rejections
 

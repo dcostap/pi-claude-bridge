@@ -8,6 +8,9 @@
 // history it sent. Copying that prefix keeps the cached request byte-identical up
 // to the aborted turn (diag/probe-fork-fidelity.mjs).
 //
+// Cached compaction summaries (cached-summary.ts) use the same copy: they resume
+// it so the summary request reads the conversation from the prompt cache.
+//
 // The copy takes fresh uuids, like the SDK's own forkSession: the killed CC
 // process may still append to the source file, and the copy must not share
 // record ids with it.
@@ -16,6 +19,7 @@ import { createHash, randomUUID } from "crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname } from "path";
 import { Session, getSessionPath, normalizeProjectPath, type JsonlRecord } from "cc-session-io";
+import { prefixDigest } from "./cached-summary.js";
 
 /** Where an aborted query started: enough to cut its session file back. */
 export interface ForkPoint {
@@ -60,12 +64,18 @@ export function forkSessionPrefix(opts: {
 	cwd: string;
 	claudeDir?: string;
 	model?: string;
+	/** prefixDigest the first `bytes` must have: guards against a file that was
+	 *  rewritten under the same id since the size was taken. */
+	digest?: string;
 }): Session {
 	const projectPath = normalizeProjectPath(opts.cwd);
 	const sourcePath = getSessionPath(opts.sourceSessionId, projectPath, opts.claudeDir);
 	const source = readFileSync(sourcePath);
 	if (source.length < opts.bytes) {
 		throw new Error(`source session is ${source.length} bytes, expected at least ${opts.bytes}`);
+	}
+	if (opts.digest !== undefined && prefixDigest(source.subarray(0, opts.bytes)) !== opts.digest) {
+		throw new Error("source session was rewritten since the cut point was taken");
 	}
 	// The size was read while the previous CC process could still be writing its
 	// trailing bookkeeping records. Keep only complete lines.

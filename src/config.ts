@@ -41,6 +41,9 @@ export interface Config {
 		// status bar and auto-compaction threshold use it. Claude Code still
 		// requests the model's full window.
 		contextWindow?: number;
+		// Write compaction summaries from the conversation Claude Code already has
+		// cached, instead of resending it to a separate summarizer. Default true.
+		cachedCompaction?: boolean;
 	};
 }
 

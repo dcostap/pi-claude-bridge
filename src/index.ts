@@ -1,15 +1,15 @@
 import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
-import { buildSessionContext, keyHint, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, convertToLlm, keyHint, serializeConversation, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, getSessionPath, normalizeProjectPath, openSession, repairToolPairing } from "cc-session-io";
-import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
+import { appendFileSync, mkdirSync, readFileSync, realpathSync, statSync } from "fs";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
 import { debugLogPath, diagLogPath } from "./log-paths.js";
-import { applyLongContext, buildModels, claudeCodeModelId, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
+import { applyLongContext, buildModels, claudeCodeModelId, resolveClaudeCodeRuntimeModel, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { forkSessionPrefix, historyFingerprint, type ForkPoint } from "./session-fork.js";
@@ -31,6 +31,32 @@ import { nonSystemMessages, toBridgeContext } from "./transcript.js";
 import { forgetSessionCwd, rememberSessionCwd, rememberSummarySession, sessionCwdFor, summarySessionFor } from "./session-cwd.js";
 import { updateUsage, type SdkUsage } from "./usage.js";
 import { rateLimitResponse } from "./rate-limit.js";
+import {
+	CACHED_SUMMARY_OVERHEAD_TOKENS,
+	CACHE_EXPIRY_MARGIN_MS,
+	DEFAULT_CACHE_TTL_MS,
+	NATIVE_PREFERENCE_MARGIN,
+	NATIVE_SUMMARY_OVERHEAD_TOKENS,
+	TRANSCRIPT_CHARS_PER_TOKEN,
+	SUMMARY_REQUEST_HEADROOM_TOKENS,
+	estimateTokens,
+	summaryCosts,
+	tailRecords,
+	buildSummaryPrompt,
+	cacheTtlFromUsage,
+	classifySummaryPrompt,
+	compactionFor,
+	completeLines,
+	describeMessage,
+	historyDigest,
+	lastAssistantText,
+	piAssistantText,
+	prefixDigest,
+	rememberCompaction,
+	type CompactionJob,
+	type SummaryCheckpoint,
+	type SummaryRecipe,
+} from "./cached-summary.js";
 
 // --- Debug logging ---
 // CLAUDE_BRIDGE_DEBUG=1 enables debug logging to the bridge log in pi's agent
@@ -209,6 +235,23 @@ interface SessionState {
 	// own records, so the prompt cache survives. Used once; on a mismatch with
 	// pi's history the sync falls back to REBUILD.
 	forkPoint?: ForkPoint & { cwd: string };
+	// The last query that completed on this conversation's session file, and the
+	// checkpoint a run ending on its answer recorded (recordSummaryCheckpoint).
+	// A compaction summary resumes a copy of the file at the checkpoint, so the
+	// conversation is read from the prompt cache. Every path that rewrites the
+	// file plants a fresh state without them.
+	lastTurn?: LastTurn;
+	checkpoint?: SummaryCheckpoint<Tool, EffortLevel>;
+}
+
+interface LastTurn {
+	sessionId: string;
+	recipe: SummaryRecipe<Tool, EffortLevel>;
+	/** When the query's last request was answered, and the cache lifetime it used. */
+	respondedAt: number;
+	cacheTtlMs: number;
+	/** The timestamp of the assistant message the query ended on, which names it in pi's history. */
+	outputTimestamp: number | undefined;
 }
 
 /**
@@ -305,8 +348,11 @@ function markRebuildForSession(piSession: string | null, event: string): void {
 	} else {
 		// A compaction replaces the start of pi's history, so a cut of the CC file
 		// can never match it. The fork point's fingerprint would catch this too.
-		const forkPoint = event.startsWith("session_compact") ? undefined : state.forkPoint;
-		sharedSessions.set(key, { ...state, needsRebuild: true, forkPoint });
+		// The same goes for a summary checkpoint, which the compaction has just used.
+		const compacted = event.startsWith("session_compact");
+		const forkPoint = compacted ? undefined : state.forkPoint;
+		const checkpoint = compacted ? undefined : state.checkpoint;
+		sharedSessions.set(key, { ...state, needsRebuild: true, forkPoint, checkpoint });
 		debug(`${event}: marking needsRebuild on session ${state.sessionId.slice(0, 8)}`);
 	}
 	// Arming parked contexts cannot wait for delivery: the entry checks
@@ -333,6 +379,93 @@ markRebuildHooks.add(markRebuildForSession);
  *  given pi session. */
 function sponsorMarkRebuildForSession(piSession: string | null, event: string): void {
 	for (const hook of markRebuildHooks) hook(piSession, event);
+}
+
+// --- Summary checkpoints ---
+//
+// A compaction summary is cheap only when it resumes the session file the last
+// turn ran on, at a point where the file and pi's history hold the same
+// conversation (cached-summary.ts). A run that ended on a completed bridge
+// answer is such a point: the file ends on that answer, and pi's history ends on
+// it too. Recorded then, and again just before a compaction in case pi started
+// the compaction before this handler ran. Every check is repeated against the
+// file and pi's branch when the summary runs, so a stale checkpoint costs a
+// fallback to pi's own summary, never a wrong one.
+
+/** pi's model-visible history for a branch, in the form the bridge receives it. */
+function modelHistory(entries: readonly SessionEntry[]): Context["messages"] {
+	return nonSystemMessages(convertToLlm(buildSessionContext(entries as SessionEntry[]).messages)) as Context["messages"];
+}
+
+/** Record a summary checkpoint for `piSessionId` if its session file ends on the
+ *  answer pi's branch ends on. Leaves an older checkpoint in place otherwise:
+ *  it may still serve, with the later messages passed as text. */
+function recordSummaryCheckpoint(piSessionId: string, entries: readonly SessionEntry[], origin: string): void {
+	const state = sessionStateFor(piSessionId);
+	// No mirror: a session no bridge query ran on, or another module instance's.
+	if (!state) return;
+	const skip = (why: string) => debug(`summary checkpoint (${origin}): not recorded, ${why}`);
+	const turn = state.lastTurn;
+	if (!turn || turn.sessionId !== state.sessionId) return skip("no completed query on the current session file");
+	if (state.needsRebuild || state.forkPoint) return skip("the session file is due to be rebuilt or cut");
+	for (const c of activeQueryContexts) {
+		if (c.piSessionId === piSessionId && c.activeQuery) return skip("a query is still writing to the session file");
+	}
+	const history = modelHistory(entries);
+	const last = history[history.length - 1] as AssistantMessage | undefined;
+	if (last?.role !== "assistant") return skip(`pi's branch ends on ${last?.role ?? "nothing"}`);
+	if (last.stopReason !== "stop") return skip(`pi's last answer stopped with ${last.stopReason}`);
+	if (last.model !== turn.recipe.modelId || last.timestamp !== turn.outputTimestamp) {
+		return skip("pi's last answer is not the one the last query wrote");
+	}
+	const claudeDir = process.env.CLAUDE_CONFIG_DIR;
+	let prefix: Buffer;
+	try {
+		prefix = completeLines(readFileSync(getSessionPath(state.sessionId, normalizeProjectPath(state.cwd), claudeDir)));
+	} catch (error) {
+		return skip(`the session file cannot be read: ${errorMessage(error)}`);
+	}
+	let fileText: string | undefined;
+	try {
+		fileText = lastAssistantText(tailRecords(prefix.toString("utf8")));
+	} catch (error) {
+		return skip(`the session file does not parse: ${errorMessage(error)}`);
+	}
+	if (fileText === undefined) return skip("the session file does not end on an answer");
+	if (fileText !== piAssistantText(last)) return skip("the session file ends on a different answer than pi's branch");
+	const checkpoint: SummaryCheckpoint<Tool, EffortLevel> = {
+		sessionId: state.sessionId,
+		cwd: state.cwd,
+		bytes: prefix.length,
+		fileDigest: prefixDigest(prefix),
+		piCount: history.length,
+		piDigest: historyDigest(history, history.length),
+		recipe: turn.recipe,
+		respondedAt: turn.respondedAt,
+		cacheTtlMs: turn.cacheTtlMs,
+	};
+	setSessionStateFor(piSessionId, { ...state, checkpoint });
+	debug(`summary checkpoint (${origin}): ${state.sessionId.slice(0, 8)}@${prefix.length}, ${history.length} pi messages, cache ttl ${turn.cacheTtlMs / 60_000}m`);
+}
+
+/** One per module instance, like markRebuildHooks: the session's events reach
+ *  whichever instance its runner loaded, the mirror lives in the serving one. */
+const SUMMARY_CHECKPOINT_HOOKS_KEY = Symbol.for("claude-bridge:summaryCheckpointHooks");
+type SummaryCheckpointHook = (piSessionId: string, entries: readonly SessionEntry[], origin: string) => void;
+const summaryCheckpointHooks: Set<SummaryCheckpointHook> =
+	((globalThis as Record<symbol, unknown>)[SUMMARY_CHECKPOINT_HOOKS_KEY] as Set<SummaryCheckpointHook> | undefined) ?? new Set();
+(globalThis as Record<symbol, unknown>)[SUMMARY_CHECKPOINT_HOOKS_KEY] = summaryCheckpointHooks;
+summaryCheckpointHooks.add(recordSummaryCheckpoint);
+
+/** Event handlers call this. A failure costs the checkpoint, never the event. */
+function sponsorSummaryCheckpoint(piSessionId: string, entries: readonly SessionEntry[], origin: string): void {
+	for (const hook of summaryCheckpointHooks) {
+		try {
+			hook(piSessionId, entries, origin);
+		} catch (error) {
+			debug(`summary checkpoint (${origin}): failed:`, error);
+		}
+	}
 }
 
 // Convert pi messages to Anthropic API format for session import.
@@ -675,6 +808,234 @@ async function runIsolatedSummary(
 	}
 }
 
+// --- Cached compaction summaries ---
+
+/** What an MCP tool answers while a summary is being written. The tool
+ *  definitions have to be served, since they are part of the cached prefix. */
+const SUMMARY_TOOLS_DISABLED = "Tools are disabled while you write the summary. Answer with text only.";
+
+/** A summarizer call of a compaction in progress: the cached path when it can
+ *  serve, otherwise pi's own summary in an isolated process, as before. */
+function compactionSummaryStreamFn(model: Model<any>, context: Context, options: SimpleStreamOptions, job: CompactionJob): AssistantMessageEventStream {
+	const stream = createAssistantMessageEventStream();
+	void (async () => {
+		let handled = false;
+		try {
+			handled = await runCachedSummary(model, context, options, stream, job);
+		} catch (error) {
+			// runCachedSummary reports its own failures; this is a bug in it.
+			debug("cached summary: threw, using the isolated summary:", error);
+			job.cachedFailed = true;
+		}
+		if (!handled) await runIsolatedSummary(model, context, options, stream);
+	})();
+	return stream;
+}
+
+interface CachedSummaryPlan {
+	checkpoint: SummaryCheckpoint<Tool, EffortLevel>;
+	prompt: string;
+}
+
+/** The message a session entry contributes to pi's context, for describeMessage. */
+function entryMessage(entry: SessionEntry | undefined): unknown {
+	const e = entry as { type?: string; message?: unknown; content?: unknown } | undefined;
+	switch (e?.type) {
+		case "message": return e.message;
+		case "custom_message": return { role: "custom", content: e.content };
+		case "compaction": return { role: "compactionSummary" };
+		case "branch_summary": return { role: "branchSummary" };
+		default: return undefined;
+	}
+}
+
+/** The checkpoint and prompt for a cached history summary, or why there is none. */
+function planCachedSummary(model: Model<any>, job: CompactionJob, nativePrompt: string): CachedSummaryPlan | string {
+	if (job.cachedFailed) return "a cached summary of this compaction already failed";
+	const cwd = sessionCwdFor(job.piSessionId);
+	if (loadConfig(cwd).provider?.cachedCompaction === false) return "disabled by provider.cachedCompaction";
+	// Overflow means the conversation no longer fits, so neither does the request.
+	if (job.reason === "overflow") return "overflow recovery";
+	const checkpoint = sessionStateFor(job.piSessionId)?.checkpoint;
+	if (!checkpoint) return "no checkpoint";
+	const { recipe } = checkpoint;
+	const cliModel = claudeCodeModelId(model, longContextSettings);
+	// The cache is per model: another model would read nothing from it.
+	if (cliModel !== recipe.cliModel) return `the summary model ${cliModel} is not the conversation's ${recipe.cliModel}`;
+	const age = Date.now() - checkpoint.respondedAt;
+	if (age > checkpoint.cacheTtlMs - CACHE_EXPIRY_MARGIN_MS) {
+		return `the cache is likely cold (${Math.round(age / 1000)}s since the last request, ttl ${checkpoint.cacheTtlMs / 1000}s)`;
+	}
+	const history = modelHistory(job.branchEntries as SessionEntry[]);
+	if (history.length < checkpoint.piCount || historyDigest(history, checkpoint.piCount) !== checkpoint.piDigest) {
+		return "pi's branch no longer starts with the checkpointed conversation";
+	}
+	const later = history.slice(checkpoint.piCount);
+	const laterMessages = later.length ? serializeConversation(later) : undefined;
+
+	const { preparation } = job;
+	const entries = job.branchEntries as SessionEntry[];
+	const prompt = buildSummaryPrompt({
+		updatesPreviousSummary: Boolean(preparation.previousSummary),
+		splitTurn: preparation.isSplitTurn && preparation.turnPrefixMessages.length > 0,
+		keptFrom: describeMessage(entryMessage(entries.find((entry) => entry.id === preparation.firstKeptEntryId))),
+		turnStart: describeMessage(preparation.turnPrefixMessages[0]),
+		laterMessages,
+		customInstructions: job.customInstructions,
+	});
+
+	const conversationTokens = preparation.tokensBefore;
+	const promptTokens = estimateTokens(prompt.length) + CACHED_SUMMARY_OVERHEAD_TOKENS;
+	const served = resolveClaudeCodeRuntimeModel(model, longContextSettings).contextWindow;
+	const needed = conversationTokens + promptTokens + SUMMARY_REQUEST_HEADROOM_TOKENS;
+	if (needed > served) return `the request would need ~${needed} tokens of a ${served} window`;
+
+	// pi's path sends this prompt: the summarized messages, serialized.
+	const nativePromptTokens = estimateTokens(nativePrompt.length, TRANSCRIPT_CHARS_PER_TOKEN) + NATIVE_SUMMARY_OVERHEAD_TOKENS;
+	const costs = summaryCosts({ conversationTokens, cachedPromptTokens: promptTokens, nativePromptTokens, cacheTtlMs: checkpoint.cacheTtlMs });
+	debug(`cached summary: estimated prompt cost cached ~${costs.cached} vs pi's ~${costs.native} input-token units (conversation ~${conversationTokens} tokens)`);
+	if (costs.native < costs.cached * NATIVE_PREFERENCE_MARGIN) return `pi's summary is estimated cheaper (~${costs.native} vs ~${costs.cached} input-token units): little of the conversation is being summarized`;
+	return { checkpoint, prompt };
+}
+
+/** Write a compaction summary by resuming a copy of the conversation's session
+ *  file with the options of its last query (cached-summary.ts). True when it
+ *  ended the stream; false when the caller should run pi's own summary. */
+async function runCachedSummary(
+	model: Model<any>,
+	context: Context,
+	options: SimpleStreamOptions,
+	stream: AssistantMessageEventStream,
+	job: CompactionJob,
+): Promise<boolean> {
+	const promptText = extractUserPrompt(toBridgeContext(context).messages);
+	const kind = promptText ? classifySummaryPrompt(promptText) : undefined;
+	if (kind !== "history") {
+		// The turn prefix of a split turn: pi shows its summarizer exactly that
+		// span, which a model reading the whole conversation does not reliably
+		// keep to (diag/probe-cached-compact.mjs). Pi serializes tool results
+		// truncated, so this prompt stays small.
+		debug(`cached summary: ${kind === "turnPrefix" ? "a split turn's prefix is summarized on pi's path" : "not a compaction summary prompt, using the isolated summary"}`);
+		return false;
+	}
+	const plan = planCachedSummary(model, job, promptText!);
+	if (typeof plan === "string") {
+		debug(`cached summary: not cached, ${plan}`);
+		return false;
+	}
+	const { checkpoint } = plan;
+	const { recipe } = checkpoint;
+	const claudeDir = process.env.CLAUDE_CONFIG_DIR;
+	const label = `cached summary (${checkpoint.sessionId.slice(0, 8)}@${checkpoint.bytes})`;
+	const aborted = (): true => {
+		debug(`${label}: aborted`);
+		stream.push({ type: "error", reason: "aborted", error: newAssistantOutput(model, "", "aborted", "Operation aborted") });
+		stream.end();
+		return true;
+	};
+
+	let sdkQuery: ReturnType<typeof query> | undefined;
+	let snapshotId: string | undefined;
+	let wasAborted = false;
+	const onAbort = () => {
+		wasAborted = true;
+		void sdkQuery?.interrupt().catch(() => {});
+		try { sdkQuery?.close(); } catch {}
+	};
+	const fail = (reason: string): false => {
+		job.cachedFailed = true;
+		debug(`${label}: failed, using the isolated summary: ${reason}`);
+		piUI?.notify(`Cached compaction summary failed (${reason}); using the standard summary instead.`, "warning");
+		return false;
+	};
+	try {
+		if (options.signal?.aborted) return aborted();
+		options.signal?.addEventListener("abort", onAbort, { once: true });
+
+		// A copy, so neither this query nor the next turn's writes reach the other's file.
+		try {
+			snapshotId = forkSessionPrefix({ sourceSessionId: checkpoint.sessionId, bytes: checkpoint.bytes, cwd: recipe.cwd, claudeDir, digest: checkpoint.fileDigest }).sessionId;
+		} catch (error) {
+			// The file changed in a way the checkpoint did not see: an expected miss, not a failure.
+			debug(`${label}: the session file no longer serves, using the isolated summary: ${errorMessage(error)}`);
+			job.cachedFailed = true;
+			return false;
+		}
+
+		const mcpServers = recipe.tools.length
+			? {
+				[MCP_SERVER_NAME]: createToolServer(MCP_SERVER_NAME, recipe.tools.map((tool) => ({
+					name: tool.name,
+					description: tool.description,
+					inputSchema: tool.parameters,
+					handler: async () => ({ content: [{ type: "text" as const, text: SUMMARY_TOOLS_DISABLED }], isError: true }),
+				}))),
+			}
+			: undefined;
+		debug(`${label}: resuming copy ${snapshotId.slice(0, 8)}, model=${recipe.cliModel} effort=${recipe.effort ?? "default"} tools=${recipe.tools.length} promptLen=${plan.prompt.length}`);
+		// Everything that shapes the request prefix is the last query's: the system
+		// prompt, the tool definitions, the model and the thinking settings.
+		sdkQuery = queryImpl({
+			prompt: plan.prompt,
+			options: {
+				cwd: recipe.cwd,
+				env: { ...process.env, ...CC_CHILD_ENV },
+				tools: [],
+				permissionMode: "bypassPermissions",
+				settings: recipe.settings,
+				systemPrompt: { type: "preset", preset: "claude_code", append: recipe.systemPromptAppend },
+				extraArgs: { ...recipe.extraArgs },
+				...(recipe.effort ? { effort: recipe.effort } : {}),
+				...(mcpServers ? { mcpServers } : {}),
+				resume: snapshotId,
+				// A tool call gets the refusal above and one more turn to answer in text.
+				maxTurns: 2,
+				...(recipe.claudeExecutable ? { pathToClaudeCodeExecutable: recipe.claudeExecutable } : {}),
+				...makeCliDebugOptions("cached-summary"),
+			},
+		});
+		if (wasAborted) onAbort();
+
+		let result: SDKMessage | undefined;
+		for await (const message of sdkQuery) {
+			if (wasAborted) break;
+			if (message.type === "result") result = message;
+		}
+		if (wasAborted || options.signal?.aborted) return aborted();
+		if (!result) return fail("Claude Code ended without a result");
+		logServedContextWindow("cached summary", result, model);
+		const errorText = resultErrorText(result);
+		if (errorText !== undefined) return fail(errorText);
+		// Streamed assistant messages carry a null stop_reason: the turn's arrives on the result.
+		const stopReason = (result as { stop_reason?: string | null }).stop_reason;
+		if (stopReason && stopReason !== "end_turn" && stopReason !== "stop_sequence") return fail(`the answer stopped with ${stopReason}`);
+		const text = String((result as { result?: unknown }).result ?? "").trim();
+		if (!text) return fail("the answer was empty");
+
+		const output = newAssistantOutput(model, text, "stop");
+		const usage = (result as { usage?: SdkUsage }).usage;
+		if (usage) recordUsage(output, usage, model);
+		debug(`${label}: done textLen=${text.length} input=${output.usage.input} cacheRead=${output.usage.cacheRead} cacheWrite=${output.usage.cacheWrite} output=${output.usage.output}`);
+		stream.push({ type: "done", reason: "stop", message: output });
+		stream.end();
+		return true;
+	} catch (error) {
+		if (wasAborted || options.signal?.aborted) return aborted();
+		return fail(errorMessage(error));
+	} finally {
+		options.signal?.removeEventListener("abort", onAbort);
+		try { sdkQuery?.close(); } catch {}
+		if (snapshotId) {
+			const id = snapshotId;
+			try { deleteSession(id, recipe.cwd, claudeDir); } catch (error) { debug(`${label}: could not delete copy ${id.slice(0, 8)}:`, error); }
+			// A process being killed may still flush a record after the first delete.
+			setTimeout(() => {
+				try { deleteSession(id, recipe.cwd, claudeDir); } catch {}
+			}, 3000).unref?.();
+		}
+	}
+}
+
 interface SyncResult {
 	sessionId: string | null;
 	preserveSharedSession?: boolean;
@@ -961,6 +1322,7 @@ export const __test = {
 	},
 	toBridgeContext,
 	isolatedStreamFn,
+	streamClaudeAgentSdk,
 	effortForReasoning,
 	syncSharedSession,
 	extractUserPromptBlocks,
@@ -1557,8 +1919,12 @@ async function consumeQuery(
 	model: Model<any>,
 	wasAborted: () => boolean,
 	queryCtx: QueryContext,
-): Promise<{ capturedSessionId?: string }> {
+): Promise<{ capturedSessionId?: string; cacheTtlMs?: number; respondedAt?: number }> {
 	let capturedSessionId: string | undefined;
+	// For a summary checkpoint: when the last request was answered (the prompt
+	// cache counts its lifetime from the last use), and the lifetime it asked for.
+	let cacheTtlMs: number | undefined;
+	let respondedAt: number | undefined;
 
 	for await (const message of sdkQuery) {
 		// CLAUDE_BRIDGE_RECORD_STREAM=<path> appends every SDK message consumeQuery
@@ -1569,6 +1935,15 @@ async function consumeQuery(
 		if (recordStreamPath) appendFileSync(recordStreamPath, `${JSON.stringify(message)}\n`);
 		if (wasAborted()) break;
 		await reportHeldRateLimit(queryCtx, model);
+		// message_start arrives once the request's prompt was read, which is when
+		// the cache was last used. The assistant messages that follow arrive as
+		// their blocks complete, later by the generation time.
+		if (message.type === "stream_event" && (message as any).event?.type === "message_start") {
+			respondedAt = Date.now();
+			cacheTtlMs = cacheTtlFromUsage((message as any).event.message?.usage) ?? cacheTtlMs;
+		} else if (message.type === "assistant") {
+			cacheTtlMs = cacheTtlFromUsage((message as any).message?.usage) ?? cacheTtlMs;
+		}
 		// Everything below the currentPiStream guard is content, which there is
 		// nowhere to put once a turn has ended on a tool call. These three are not
 		// content and must not share that gate:
@@ -1680,7 +2055,7 @@ async function consumeQuery(
 	// DEBUG: trace when consumeQuery exits
 	debug(`consumeQuery: for-await loop exited, wasAborted=${wasAborted()}, capturedSessionId=${capturedSessionId?.slice(0, 8) ?? "none"}`);
 
-	return { capturedSessionId };
+	return { capturedSessionId, cacheTtlMs, respondedAt };
 }
 
 /** The trailing user turn as content blocks, or null if there isn't one.
@@ -1848,6 +2223,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// in completeSummarization. Their prompts bypass the capture boundaries, so route
 	// them to an isolated persistSession:false CC process without session sync.
 	if (options?.cacheRetention === "none") {
+		// A compaction's summarizer calls carry its abort signal, and may be served
+		// from the conversation's prompt cache instead.
+		const job = compactionFor(options.signal);
+		if (job) {
+			debug(`provider: compaction summary call (reason=${job.reason}), msgs=${context.messages.length}`);
+			return compactionSummaryStreamFn(model, context, options, job);
+		}
 		debug(`provider: one-off summarizer call (cacheRetention none) routed to isolated summary, msgs=${context.messages.length}`);
 		return isolatedStreamFn(model, context, options);
 	}
@@ -2137,6 +2519,19 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		...makeCliDebugOptions("provider"),
 	};
 
+	// What a compaction summary needs to send this query's request prefix again.
+	const recipe: SummaryRecipe<Tool, EffortLevel> = {
+		cwd,
+		modelId: model.id,
+		cliModel,
+		systemPromptAppend: systemPromptAppend || undefined,
+		tools: mcpTools,
+		effort,
+		extraArgs,
+		settings: queryOptions.settings as Record<string, unknown>,
+		claudeExecutable,
+	};
+
 	debug("provider: fresh query",
 		`model=${cliModel} msgs=${context.messages.length} tools=${mcpTools.length}`,
 		`resume=${resumeSessionId?.slice(0, 8) ?? "none"} effort=${effort ?? "default"}`,
@@ -2170,7 +2565,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	// Background consumer — runs until query ends
 	consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx)
-		.then(async ({ capturedSessionId }) => {
+		.then(async ({ capturedSessionId, cacheTtlMs, respondedAt }) => {
 			debug(`provider: consumeQuery completed, stopReason=${queryCtx.turnOutput?.stopReason}, error=${queryCtx.turnOutput?.errorMessage}, aborted=${wasAborted}`);
 
 			// Discarded out from under: the query continuing the turn owns the context,
@@ -2219,7 +2614,15 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
 					// A missed steer may precede the first mirror or arrive while this
 					// query is still able to complete. Preserve both rebuild signals.
-					setSessionStateFor(queryCtx.piSessionId, { ...state, sessionId, cursor, cwd, piSessionId: queryCtx.piSessionId ?? undefined, needsRebuild: queryCtx.missedSteer || state?.needsRebuild });
+					const lastTurn: LastTurn = {
+						sessionId,
+						recipe,
+						respondedAt: respondedAt ?? Date.now(),
+						// A query that wrote no cache entry says nothing about its lifetime.
+						cacheTtlMs: cacheTtlMs ?? (state?.lastTurn?.sessionId === sessionId ? state.lastTurn.cacheTtlMs : DEFAULT_CACHE_TTL_MS),
+						outputTimestamp: queryCtx.turnOutput?.timestamp,
+					};
+					setSessionStateFor(queryCtx.piSessionId, { ...state, sessionId, cursor, cwd, piSessionId: queryCtx.piSessionId ?? undefined, needsRebuild: queryCtx.missedSteer || state?.needsRebuild, lastTurn });
 				}
 			}
 
@@ -2548,7 +2951,27 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 	pi.on("session_before_compact", (event, ctx) => {
-		rememberSummarySession(event.signal, ctx.sessionManager.getSessionId());
+		const piSessionId = ctx.sessionManager.getSessionId();
+		rememberSummarySession(event.signal, piSessionId);
+		// The summarizer calls carry this signal: it is how the provider tells they
+		// belong to this compaction, and may be served from the prompt cache.
+		// Observes only, like every handler here: pi or an extension still owns the
+		// compaction, and nothing is returned.
+		rememberCompaction(event.signal, {
+			piSessionId,
+			reason: event.reason,
+			willRetry: event.willRetry,
+			customInstructions: event.customInstructions,
+			preparation: event.preparation,
+			branchEntries: event.branchEntries,
+		});
+		sponsorSummaryCheckpoint(piSessionId, event.branchEntries, "session_before_compact");
+	});
+	// A run that ends on a completed answer leaves the session file and pi's
+	// history holding the same conversation: the point a compaction summary can
+	// resume from. Before any compaction this run triggers.
+	pi.on("agent_end", (_event, ctx) => {
+		sponsorSummaryCheckpoint(ctx.sessionManager.getSessionId(), ctx.sessionManager.getBranch(), "agent_end");
 	});
 	pi.on("session_before_tree", (event, ctx) => {
 		rememberSummarySession(event.signal, ctx.sessionManager.getSessionId());
