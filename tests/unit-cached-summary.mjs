@@ -225,7 +225,7 @@ async function bridgeSession(t, { turns = 2, summarize, beforeCompact } = {}) {
 	assert.deepEqual(loader.getExtensions().errors, []);
 	const { session } = await createAgentSession({ cwd, agentDir: process.env.PI_CODING_AGENT_DIR, resourceLoader: loader, sessionManager: manager, settingsManager: settings, noTools: "all", model });
 	await session.bindExtensions({ onError: (error) => { throw new Error(error.error); } });
-	Object.assign(handle, { session, manager, piSessionId: manager.getSessionId() });
+	Object.assign(handle, { session, manager, settings, piSessionId: manager.getSessionId() });
 	__test.setPiUI({ notify: (message, level) => notices.push({ message, level }) });
 	t.after(async () => {
 		await session.extensionRunner.emit({ type: "session_shutdown" });
@@ -387,6 +387,47 @@ describe("cached compaction summaries", () => {
 		assert.equal(s.manager.getBranch().filter((e) => e.type === "compaction").length, 0);
 	});
 
+	/** Turn pi's auto-compaction on after the setup turns, for one compaction, and prompt once more. */
+	async function autoCompact(s) {
+		const reasons = [];
+		const unsubscribe = s.session.subscribe((event) => {
+			if (event.type !== "compaction_end") return;
+			reasons.push({ reason: event.reason, willRetry: event.willRetry, error: event.errorMessage });
+			// The fake turns all report the same usage, which would compact again after the next one.
+			s.settings.applyOverrides({ compaction: { enabled: false } });
+		});
+		s.settings.applyOverrides({ compaction: { enabled: true } });
+		await s.session.prompt("one more question " + "context ".repeat(150));
+		unsubscribe();
+		return { reasons, compactions: s.manager.getBranch().filter((e) => e.type === "compaction") };
+	}
+
+	it("serves pi's threshold auto-compaction from the cache", { timeout: 20000 }, async (t) => {
+		const s = await bridgeSession(t, { summarize: cachedAnswer });
+		// Each turn reports ~1.2k context tokens: past a 200k window less 199k reserve.
+		s.settings.applyOverrides({ compaction: { reserveTokens: 199_000 } });
+		const { reasons, compactions } = await autoCompact(s);
+		assert.deepEqual(reasons, [{ reason: "threshold", willRetry: false, error: undefined }]);
+		assert.equal(s.calls.filter((c) => c.kind === "cached").length, 1);
+		assert.equal(compactions.length, 1);
+		assert.match(compactions[0].summary, /CACHED-HISTORY/);
+		assert.deepEqual(s.notices, []);
+	});
+
+	it("serves an overflow auto-compaction of a completed answer from the cache", { timeout: 20000 }, async (t) => {
+		// pi calls it "overflow", with no retry, when a completed answer's input passed
+		// pi's registered window: a run that grew past the threshold before agent_end.
+		// The served window (200k for this model) still holds the conversation.
+		const s = await bridgeSession(t, { summarize: cachedAnswer });
+		// What provider.contextWindow does: register less than the 200k served for this model.
+		s.session.agent.state.model = { ...s.session.model, contextWindow: 1000 };
+		const { reasons, compactions } = await autoCompact(s);
+		assert.deepEqual(reasons, [{ reason: "overflow", willRetry: false, error: undefined }]);
+		assert.equal(s.calls.filter((c) => c.kind === "cached").length, 1);
+		assert.equal(compactions.length, 1);
+		assert.match(compactions[0].summary, /CACHED-HISTORY/);
+	});
+
 	it("leaves overflow recovery to pi's summary", { timeout: 20000 }, async (t) => {
 		const s = await bridgeSession(t, { summarize: cachedAnswer });
 		assert.ok(s.state().checkpoint);
@@ -394,7 +435,7 @@ describe("cached compaction summaries", () => {
 		const controller = new AbortController();
 		const branchEntries = s.manager.getBranch();
 		rememberCompaction(controller.signal, {
-			piSessionId: s.piSessionId, reason: "overflow", willRetry: false, branchEntries,
+			piSessionId: s.piSessionId, reason: "overflow", willRetry: true, branchEntries,
 			preparation: { firstKeptEntryId: branchEntries.at(-1).id, messagesToSummarize: [], turnPrefixMessages: [], isSplitTurn: false, tokensBefore: 1000 },
 		});
 		const prompt = { role: "user", content: "<conversation>\n[User]: hi\n</conversation>\n\nSummarize", timestamp: 0 };

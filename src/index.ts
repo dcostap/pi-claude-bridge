@@ -854,8 +854,11 @@ function planCachedSummary(model: Model<any>, job: CompactionJob, nativePrompt: 
 	if (job.cachedFailed) return "a cached summary of this compaction already failed";
 	const cwd = sessionCwdFor(job.piSessionId);
 	if (loadConfig(cwd).provider?.cachedCompaction === false) return "disabled by provider.cachedCompaction";
-	// Overflow means the conversation no longer fits, so neither does the request.
-	if (job.reason === "overflow") return "overflow recovery";
+	// pi retries a request the API rejected as too long: that conversation no longer
+	// fits, so neither does the summary request. pi's other "overflow" is a completed
+	// answer whose input passed pi's registered window, which can be smaller than the
+	// served one; the window check below decides that case like a threshold compaction.
+	if (job.reason === "overflow" && job.willRetry) return "overflow recovery";
 	const checkpoint = sessionStateFor(job.piSessionId)?.checkpoint;
 	if (!checkpoint) return "no checkpoint";
 	const { recipe } = checkpoint;

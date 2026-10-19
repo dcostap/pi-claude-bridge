@@ -138,7 +138,7 @@ The bridge records a checkpoint after each answer and uses pi's path instead whe
 - the cache has likely expired (its lifetime, read from Claude Code's usage, minus 30 seconds)
 - the summary model is not the conversation's model, or pi's branch no longer starts with the checkpointed conversation (for example after a tree navigation)
 - the session file changed since the checkpoint
-- the compaction recovers from a context overflow, or the request would not fit the context window
+- the compaction recovers from a request the API rejected as too long, or the summary request would not fit the context window
 - pi's summary is estimated to cost less, which happens when only a small part of a long conversation is summarized
 
 Messages pi added after the checkpoint go into the request as text. If the cached query fails, the bridge shows a warning and pi's path writes the summary. Set `provider.cachedCompaction` to `false` to always use pi's path. `diag/probe-cached-compact.mjs` measures both paths against the live API.
