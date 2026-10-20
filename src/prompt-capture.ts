@@ -1,7 +1,7 @@
 import type { Skill } from "@earendil-works/pi-coding-agent";
 import { formatProjectContext } from "./agents-md.js";
 import { debugLogPath } from "./log-paths.js";
-import { renderSkillsBlock, type SkillReadTool } from "./skills.js";
+import { MCP_TOOL_PREFIX, renderSkillsBlock, type SkillReadTool } from "./skills.js";
 
 // What pi assembled for one agent, kept so the bridge can append only the
 // portable parts after Claude Code's own preset.
@@ -15,6 +15,8 @@ export type PromptCaptureInput = {
 	 *  section name. pi renders each one as `<name>\ncontent\n</name>` after the built-in
 	 *  sections; the projection does the same. */
 	sections?: Record<string, string>;
+	/** Guideline bullets that tools and extensions add to pi's rules section. See `collectGuidelines`. */
+	guidelines?: string[];
 };
 
 type InheritedPrompt = {
@@ -94,6 +96,7 @@ export class PromptCaptures {
 		// Copied, not referenced: the caller's systemPromptOptions is a live object that
 		// later before_agent_start handlers mutate.
 		capture.sections = { ...input.sections };
+		capture.guidelines = [...(input.guidelines ?? [])];
 		capture.source = source;
 		if (!existing || customChanged) {
 			capture.inherited = this.findInheritedPrompts(systemPrompt, input.custom);
@@ -348,6 +351,9 @@ function projectCapture(
 
 		const custom = projectCustom(capture, options, visiting);
 		const parts: PromptPart[] = [];
+		// pi renders its rules section before the append and the project context.
+		const guidelines = formatGuidelines(capture.guidelines ?? []);
+		if (guidelines) parts.push({ label: "the tool guidelines", text: guidelines });
 		const context = formatProjectContext(capture.contextFiles);
 		if (context) parts.push({ label: "the project context block", text: context });
 		const skills = renderSkillsBlock(ownSkills, options.skillReadTool);
@@ -365,6 +371,45 @@ function projectCapture(
 	} finally {
 		visiting.delete(capture);
 	}
+}
+
+/**
+ * The bullets of pi's rules section that tools and extensions wrote: each shown
+ * tool's guidelines in tool order, then the general ones, trimmed and once each,
+ * as pi's builder collects them. The projection drops pi's harness, and this
+ * section with it, but these bullets are the user's tool policy ("use
+ * everything_search instead of find"). pi's own fixed bullets ("Be concise in your
+ * responses") stay out: Claude Code's preset covers them. A custom prompt replaces
+ * pi's whole default prompt, rules included, so it carries none.
+ *
+ * pi before 1.1 merged each tool's guidelines into `promptGuidelines` and had no
+ * `toolGuidelines`; reading both covers either shape.
+ */
+export function collectGuidelines(options: {
+	customPrompt?: string;
+	selectedTools?: string[];
+	hiddenTools?: string[];
+	toolGuidelines?: Record<string, string[]>;
+	promptGuidelines?: string[];
+} | undefined): string[] {
+	if (!options || options.customPrompt) return [];
+	const toolGuidelines = options.toolGuidelines ?? {};
+	const hidden = new Set(options.hiddenTools ?? []);
+	const shownTools = (options.selectedTools ?? Object.keys(toolGuidelines)).filter((name) => !hidden.has(name));
+	const result: string[] = [];
+	for (const raw of [...shownTools.flatMap((name) => toolGuidelines[name] ?? []), ...(options.promptGuidelines ?? [])]) {
+		const guideline = raw.trim();
+		if (guideline && !result.includes(guideline)) result.push(guideline);
+	}
+	return result;
+}
+
+/** Claude Code calls each pi tool under the MCP prefix, so the note maps the bare
+ *  names in the bullets to the tools it sees. */
+function formatGuidelines(guidelines: string[]): string | undefined {
+	if (guidelines.length === 0) return undefined;
+	const bullets = guidelines.map((guideline) => `- ${guideline}`).join("\n");
+	return `<tool_guidelines>\nTool names here omit the \`${MCP_TOOL_PREFIX}\` prefix.\n\n${bullets}\n</tool_guidelines>`;
 }
 
 function assertSendablePrompt(parts: readonly PromptPart[], capture: PromptCapture): void {

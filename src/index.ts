@@ -19,6 +19,7 @@ import { QueryContext, ctx } from "./query-state.js";
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
 import { claudeCodeSettings, loadConfig, markAskClaudeDeprecationNoticeShown, markStartupNoticeShown, type Config } from "./config.js";
 import {
+	collectGuidelines,
 	collectPromptSkills,
 	projectPromptCapture,
 	sharedPromptCaptures,
@@ -3083,7 +3084,7 @@ export default function (pi: ExtensionAPI) {
 	// Code's preset carries its own tool and permission guidance that the bridge
 	// still depends on, so both flags are forwarded as an append.
 	//
-	// The options (custom/append/contextFiles/skills/sections) are pi config, stable across a
+	// The options (custom/append/contextFiles/skills/sections/guidelines) are pi config, stable across a
 	// turn; only the auto-generated tool list in the rendered prompt varies. Stash them
 	// at before_agent_start so the agent_start recording below can reuse them.
 	type RecordOptions = Parameters<typeof recordSystemPrompt>[2];
@@ -3095,6 +3096,9 @@ export default function (pi: ExtensionAPI) {
 		skills?: Parameters<typeof promptCaptures.record>[1]["skills"];
 		sections?: Record<string, string>;
 		selectedTools?: string[];
+		hiddenTools?: string[];
+		toolGuidelines?: Record<string, string[]>;
+		promptGuidelines?: string[];
 	} | undefined) {
 		if (!systemPrompt) return;
 		const hasRead = !options?.selectedTools || options.selectedTools.includes("read");
@@ -3104,6 +3108,7 @@ export default function (pi: ExtensionAPI) {
 			contextFiles: options?.contextFiles ?? [],
 			skills: hasRead ? options?.skills ?? [] : [],
 			sections: options?.sections,
+			guidelines: collectGuidelines(options),
 		}, source);
 	}
 	pi.on("before_agent_start", (event) => {

@@ -3,8 +3,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { collectPromptSkills, PI_PREAMBLE, projectPromptCapture, PromptCaptures } from "../src/prompt-capture.js";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { collectGuidelines, collectPromptSkills, PI_PREAMBLE, projectPromptCapture, PromptCaptures } from "../src/prompt-capture.js";
 
 const PI_SYSTEM_PROMPT = fileURLToPath(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/system-prompt.js", import.meta.url));
 
@@ -353,6 +353,80 @@ describe("prompt sections", () => {
 				`the ${name} section must be checked on its own`,
 			);
 		}
+	});
+});
+
+describe("tool guidelines", () => {
+	const OPTIONS = {
+		selectedTools: ["read", "everything_search", "internal"],
+		hiddenTools: ["internal"],
+		toolGuidelines: {
+			read: [" Use read to examine files instead of cat or sed. "],
+			everything_search: ["MUST use `everything_search` instead of find.", "Use read to examine files instead of cat or sed."],
+			internal: ["Hidden tools add no rules."],
+			unselected: ["Unselected tools add no rules."],
+		},
+		promptGuidelines: ["Write short sentences.", ""],
+	};
+	const GUIDELINES = [
+		"Use read to examine files instead of cat or sed.",
+		"MUST use `everything_search` instead of find.",
+		"Write short sentences.",
+	];
+
+	it("collects the bullets pi's rules section takes from tools and extensions, without pi's fixed ones", async () => {
+		assert.deepEqual(collectGuidelines(OPTIONS), GUIDELINES);
+
+		// pi's own builder: the same bullets in the same order, plus its fixed ones.
+		assert.ok(existsSync(PI_SYSTEM_PROMPT), `pi's system prompt module is not at ${PI_SYSTEM_PROMPT}; if pi moved it, update this test`);
+		const { buildSystemPromptSections } = await import(pathToFileURL(PI_SYSTEM_PROMPT).href);
+		const rules = buildSystemPromptSections({ cwd: "/w", ...OPTIONS }).rules
+			.split("\n")
+			.filter((line) => line.startsWith("- "))
+			.map((line) => line.slice(2));
+		assert.deepEqual(rules, [...GUIDELINES, "Be concise in your responses", "Show file paths clearly when working with files"]);
+	});
+
+	it("collects none for a custom prompt, which replaces pi's rules section", () => {
+		assert.deepEqual(collectGuidelines({ ...OPTIONS, customPrompt: "my own prompt" }), []);
+		assert.deepEqual(collectGuidelines(undefined), []);
+	});
+
+	it("reads pi's older shape, with every guideline in promptGuidelines", () => {
+		assert.deepEqual(collectGuidelines({ selectedTools: ["read"], promptGuidelines: GUIDELINES }), GUIDELINES);
+	});
+
+	it("projects the bullets first, with the MCP prefix note", () => {
+		const captures = new PromptCaptures();
+		captures.record("guided prompt", capture({ guidelines: GUIDELINES, append: "be careful" }));
+
+		assert.equal(project(captures, "guided prompt"), [
+			"<tool_guidelines>",
+			"Tool names here omit the `mcp__custom-tools__` prefix.",
+			"",
+			...GUIDELINES.map((guideline) => `- ${guideline}`),
+			"</tool_guidelines>",
+			"",
+			"be careful",
+		].join("\n"));
+	});
+
+	it("projects an inherited prompt's bullets through a child, once", () => {
+		const captures = new PromptCaptures();
+		captures.record(PARENT_KEY, capture({ guidelines: GUIDELINES }));
+		captures.record(CHILD_KEY, capture({ custom: `${PARENT_KEY}${CHILD_SUFFIX}` }));
+
+		const child = project(captures, CHILD_KEY);
+		assert.equal(occurrences(child, "<tool_guidelines>"), 1);
+		assert.match(child, /child rules/);
+		assert.doesNotMatch(child, /operating inside pi/);
+	});
+
+	it("refuses bullets carrying Anthropic's trigger pair", () => {
+		const captures = new PromptCaptures();
+		captures.record("guarded prompt", capture({ guidelines: ["see docs/custom-provider.md", "and docs/packages.md"] }));
+
+		assert.throws(() => project(captures, "guarded prompt"), /in the tool guidelines/);
 	});
 });
 
