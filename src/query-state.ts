@@ -6,7 +6,7 @@
 //
 // Extracted from index.ts so tests can import without activating the extension.
 
-import type { AssistantMessage, AssistantMessageEventStream, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import type { AssistantMessage, AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import type { McpResult } from "./extract-tool-results.js";
 import type { PromptStream } from "./prompt-stream.js";
 import type { RateLimitInfo } from "./rate-limit.js";
@@ -26,6 +26,8 @@ export class QueryContext {
 	 *  tool call has already ended the stream, so it waits for the next call's stream. */
 	heldRateLimit: RateLimitInfo | undefined;
 	latestCursor = 0;
+	/** The longest context pi has passed this query: the messages latestCursor counts. */
+	latestMessages: Context["messages"] = [];
 	pendingToolCalls = new Map<string, PendingToolCall>();
 	pendingResults = new Map<string, McpResult>();
 	/** tool_use ids emitted this turn. Sole purpose is routing a delivered result

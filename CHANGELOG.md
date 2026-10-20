@@ -2,6 +2,7 @@
 
 ## Unreleased (fork)
 
+- **Add: resume Claude Code's session file in a new pi process** — the bridge writes a record for each pi session in `claude-bridge-sessions/` in pi's agent dir. A resumed session (`pi -c`, `/resume`, `/reload`) then uses the same file instead of a rebuild from pi's history, so the first turn reads the conversation from the prompt cache (16% to 99% cache read in a live Haiku test). A query that did not end normally is cut back to where it started, as after an abort. A mismatch in cwd, file or history rebuilds as before. A query that fails deletes the record.
 - **Add: cached compaction summaries** — on a bridge model, a compaction resumes a copy of Claude Code's session file with the last turn's options and asks for the summary there, so the conversation is read from the prompt cache instead of being sent again. This covers `/compact` and pi's auto-compaction, including the "overflow" pi reports when a completed answer passed the registered window; only the retry after a request rejected as too long stays on pi's path. A split turn's prefix stays on pi's own summary call. It falls back to pi's summary when the cache has likely expired, the history or session file changed, the request would not fit, or pi's path is estimated to cost less. Turn it off with `provider.cachedCompaction: false`.
 - **Fix: cut Claude Code's session file after an abort instead of rebuilding** — keeps the prompt cache for the conversation before the aborted turn.
 - **Add: `provider.contextWindow`** — caps the context window the bridge registers with pi.

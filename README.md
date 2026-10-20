@@ -161,7 +161,9 @@ Requires the following in `~/.pi/agent/subagents.json`:
 
 ## Known issues
 
-**A session rebuild re-sends the whole conversation.** The bridge rewrites Claude Code's session from pi's history whenever the two diverge — after an abort, `/compact`, tree navigation, an API error, or on returning to a session — and the next request usually misses the prompt cache for everything past the system prompt. Abort-heavy sessions cost noticeably more.
+**A session rebuild re-sends the whole conversation.** The bridge rewrites Claude Code's session from pi's history whenever the two diverge — after `/compact`, tree navigation, an API error, or a turn from another model — and the next request usually misses the prompt cache for everything past the system prompt. An abort does not rebuild: the bridge cuts the session file back to where the aborted turn started.
+
+**Returning to a session.** The bridge keeps a small record for each pi session in `claude-bridge-sessions/` in pi's agent dir. It names the Claude Code session file and the part of pi's history that file holds. When you resume a session in a new pi process, or after `/reload`, the bridge reads the record and resumes the same file, so the first turn reads the conversation from the prompt cache. If the last query did not end normally, the bridge cuts the file back to where that query started. If the cwd, the file or the history does not match the record, the bridge rebuilds as before. Records older than 30 days are deleted at startup. After a restart, the first compaction uses pi's summary, because the cached summary needs the last turn's options from the old process.
 
 **Files Claude Code edits are not carried across a rebuild.** The edit itself survives in the history as a tool call and result — what's lost is the post-edit file snapshot. `@file` expansions *are* carried.
 

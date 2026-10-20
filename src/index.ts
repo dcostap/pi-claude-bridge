@@ -5,7 +5,7 @@ import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@a
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, getSessionPath, normalizeProjectPath, openSession, repairToolPairing } from "cc-session-io";
-import { appendFileSync, mkdirSync, readFileSync, realpathSync, statSync } from "fs";
+import { appendFileSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync } from "fs";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
 import { debugLogPath, diagLogPath } from "./log-paths.js";
@@ -13,6 +13,7 @@ import { applyLongContext, buildModels, claudeCodeModelId, resolveClaudeCodeRunt
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { forkSessionPrefix, historyFingerprint, type ForkPoint } from "./session-fork.js";
+import { deleteSessionRecord, pruneSessionRecords, readSessionRecord, sessionFileExists, sessionRecordDir, writeSessionRecord } from "./session-record.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, ctx } from "./query-state.js";
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
@@ -1138,6 +1139,10 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	const history = nonSystemMessages(messages);
 	const priorMessages = history.slice(0, turnStart(history)); // everything before the current user turn
 
+	// A new pi process (or a /reload) has no mirror yet: take it from the session
+	// record, so the first turn resumes or cuts the existing file instead of rebuilding.
+	if (!sharedSession && piSessionId) sharedSession = restoreSessionState(piSessionId, priorMessages, cwd);
+
 	// FORK path: the last query was aborted. Takes precedence over needsRebuild,
 	// which the abort also set as the fallback.
 	if (sharedSession?.forkPoint) {
@@ -1274,6 +1279,68 @@ function syncFromForkPoint(
 	return { sessionId: session.sessionId };
 }
 
+/** The mirror a session record describes, planted for `piSessionId`. Null, and
+ *  nothing planted, when there is no record or it does not fit pi's history: the
+ *  sync then rebuilds as for a first turn. */
+function restoreSessionState(piSessionId: string, priorMessages: Context["messages"], cwd: string): SessionState | null {
+	const record = readSessionRecord(piSessionId);
+	if (!record) return null;
+	const label = `restore: ${record.kind} record for ${record.sessionId.slice(0, 8)}`;
+	if (record.cwd !== cwd) {
+		debug(`${label}: cwd changed (${record.cwd} → ${cwd}), rebuilding instead`);
+		return null;
+	}
+	if (!sessionFileExists(record, process.env.CLAUDE_CONFIG_DIR)) {
+		debug(`${label}: session file is gone, rebuilding instead`);
+		return null;
+	}
+	const length = record.kind === "start" ? record.piTurnStart : record.cursor;
+	if (priorMessages.length < length || historyFingerprint(priorMessages, length) !== record.fingerprint) {
+		debug(`${label}: pi history no longer starts with the ${length} messages the file holds, rebuilding instead`);
+		return null;
+	}
+	const base: SessionState = { sessionId: record.sessionId, cursor: length, cwd, piSessionId };
+	// A start record means the query never ended normally: cut the file back to
+	// where it began, as after an abort. Rotate, since its process may still be alive.
+	const state: SessionState = record.kind === "complete" ? base : {
+		...base,
+		needsRebuild: true,
+		forceRotate: true,
+		forkPoint: { sessionId: record.sessionId, bytes: record.bytes, piTurnStart: record.piTurnStart, fingerprint: record.fingerprint, cwd },
+	};
+	setSessionStateFor(piSessionId, state);
+	debug(`${label}: ${record.kind === "complete" ? "resuming the file" : `cutting the file back to ${record.bytes} bytes`}, cursor=${length}`);
+	return state;
+}
+
+/** Record where a query starts, so a new process can cut its file back to here.
+ *  A query with no file to resume (a clean start) removes the record instead. */
+function saveStartRecord(piSessionId: string, forkPoint: (ForkPoint & { cwd: string }) | null): void {
+	try {
+		if (forkPoint) writeSessionRecord(piSessionId, { kind: "start", ...forkPoint });
+		else deleteSessionRecord(piSessionId);
+	} catch (error) {
+		debug("session record: could not save the start record:", error);
+	}
+}
+
+/** Record a query that ended normally: its file holds `messages` up to `cursor`
+ *  (pi's count, system messages included) plus the answer pi appends next. */
+function saveCompleteRecord(piSessionId: string, sessionId: string, cwd: string, messages: Context["messages"], cursor: number): void {
+	// The mirror's own cursor can be ahead of the messages this query saw. The
+	// start record still describes the file then.
+	if (cursor > messages.length) {
+		debug(`session record: cursor ${cursor} is past the ${messages.length} messages seen, keeping the start record`);
+		return;
+	}
+	const history = nonSystemMessages(messages.slice(0, cursor));
+	try {
+		writeSessionRecord(piSessionId, { kind: "complete", cwd, sessionId, cursor: history.length, fingerprint: historyFingerprint(history, history.length) });
+	} catch (error) {
+		debug("session record: could not save the complete record:", error);
+	}
+}
+
 /** Where a query that resumes `sessionId` starts, for syncFromForkPoint after
  *  an abort. Null when there is no file to cut back to. */
 function forkPointAt(sessionId: string | null, cwd: string, messages: Context["messages"]): (ForkPoint & { cwd: string }) | null {
@@ -1299,9 +1366,20 @@ export const __test = {
 		queryImpl = fn ?? query;
 	},
 	resetSharedSession(piSessionId?: string | null) {
-		// No id: full reset (the pre-map semantics — tests start from a blank slate).
-		if (piSessionId === undefined) sharedSessions.clear();
-		else setSessionStateFor(piSessionId, null);
+		// No id: full reset (the pre-map semantics — tests start from a blank slate),
+		// session records included.
+		if (piSessionId === undefined) {
+			sharedSessions.clear();
+			rmSync(sessionRecordDir(), { recursive: true, force: true });
+		} else {
+			setSessionStateFor(piSessionId, null);
+			deleteSessionRecord(piSessionId);
+		}
+		historyRewrittenBySession.clear();
+	},
+	/** What a new pi process sees: no mirrors in memory, session records on disk. */
+	forgetSessionMirrors() {
+		sharedSessions.clear();
 		historyRewrittenBySession.clear();
 	},
 	markRebuildForSession,
@@ -2293,6 +2371,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		const state = sessionStateFor(resultCtx.piSessionId);
 		if (state) state.cursor = context.messages.length;
 		resultCtx.latestCursor = Math.max(resultCtx.latestCursor, context.messages.length);
+		if (context.messages.length >= resultCtx.latestMessages.length) resultCtx.latestMessages = context.messages;
 		return stream;
 	}
 
@@ -2392,6 +2471,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	queryCtx.turnToolCallIds = [];
 	queryCtx.resetTurnState(model);
 	queryCtx.latestCursor = 0;
+	queryCtx.latestMessages = context.messages;
 	// The served pi session, for rewrite attribution on delivery (issue #101
 	// follow-up) and on SessionState. A fresh instance of this module inside a
 	// worktree-spawned subagent has its own contexts; each records its own.
@@ -2419,6 +2499,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const { sessionId: resumeSessionId } = syncResult;
 	// Before the query starts: CC appends to the resumed file from here on.
 	const forkPoint = syncResult.preserveSharedSession ? null : forkPointAt(resumeSessionId, cwd, context.messages);
+	if (piSessionId && !syncResult.preserveSharedSession) saveStartRecord(piSessionId, forkPoint);
 	const promptBlocks = extractUserPromptBlocks(context.messages);
 	let promptText = extractUserPrompt(context.messages) ?? "";
 
@@ -2625,7 +2706,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 						cacheTtlMs: cacheTtlMs ?? (state?.lastTurn?.sessionId === sessionId ? state.lastTurn.cacheTtlMs : DEFAULT_CACHE_TTL_MS),
 						outputTimestamp: queryCtx.turnOutput?.timestamp,
 					};
-					setSessionStateFor(queryCtx.piSessionId, { ...state, sessionId, cursor, cwd, piSessionId: queryCtx.piSessionId ?? undefined, needsRebuild: queryCtx.missedSteer || state?.needsRebuild, lastTurn });
+					const needsRebuild = queryCtx.missedSteer || state?.needsRebuild;
+					setSessionStateFor(queryCtx.piSessionId, { ...state, sessionId, cursor, cwd, piSessionId: queryCtx.piSessionId ?? undefined, needsRebuild, lastTurn });
+					// With a rebuild pending, the file no longer matches pi's history: the
+					// start record, which cuts it back, stays.
+					if (queryCtx.piSessionId && !needsRebuild) {
+						const messages = queryCtx.latestMessages.length >= context.messages.length ? queryCtx.latestMessages : context.messages;
+						saveCompleteRecord(queryCtx.piSessionId, sessionId, cwd, messages, cursor);
+					}
 				}
 			}
 
@@ -2650,6 +2738,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				// state after the error. Other sessions' mirrors stay — one
 				// session's failure says nothing about another's conversation.
 				setSessionStateFor(queryCtx.piSessionId, null);
+				// The file itself may have caused the error, so a new process must not
+				// resume or cut it either.
+				if (queryCtx.piSessionId) {
+					try { deleteSessionRecord(queryCtx.piSessionId); } catch (e) { debug("session record: could not delete after an error:", e); }
+				}
 			}
 			promptStream.fail(error instanceof Error ? error : new Error(String(error)));
 			if (queryCtx.turnOutput) {
@@ -2925,6 +3018,13 @@ export default function (pi: ExtensionAPI) {
 
 	if (!config.startupNoticeShown && config.provider?.plan === undefined) {
 		pendingNotices.push('Are you using a Max plan? You need to set provider.plan to "max" to unlock 1M context in Opus.');
+	}
+
+	try {
+		const pruned = pruneSessionRecords();
+		if (pruned > 0) debug(`session records: removed ${pruned} older than 30 days`);
+	} catch (error) {
+		debug("session records: prune failed:", error);
 	}
 
 	// Reset shared session on pi session lifecycle events
