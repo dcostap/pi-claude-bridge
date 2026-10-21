@@ -6,8 +6,13 @@
 //
 //   P1  clean start
 //   P2  reuse    control
-//   P3  reuse    runs `sleep 45`; the probe aborts 3 s after the tool starts
+//   P3  reuse    runs --rounds `echo` calls one at a time, then `sleep 45`; the
+//                probe aborts 3 s after the sleep starts
 //   P4  fork     the turn after the abort
+//
+// With --restart the probe kills pi instead of aborting, as when its host quits,
+// and continues the session in a new pi process: P4 then forks from the session
+// record the killed process left.
 //   P5  reuse    control after the fork
 //
 // For P4 it reports the sync path, cacheRead against what P3's last request left
@@ -17,13 +22,18 @@
 // should be identical. Pass --bridge to measure another checkout, such as one
 // without the fork path, where P4 rebuilds.
 //
+// The tool rounds before the sleep matter: the API finds a cached prefix only
+// about 20 content blocks back from a request's cache breakpoint, so a cut that
+// leaves many rounds for pi to append misses at P4 even when it matches.
+//
 //   node diag/probe-abort-fork.mjs [--model claude-bridge/claude-haiku-5-5]
-//       [--thinking low|off] [--bridge DIR] [--pi pi] [--out DIR]
+//       [--thinking low|off] [--rounds 8] [--restart] [--bridge DIR] [--pi pi] [--out DIR]
 
 import { spawn } from "node:child_process";
-import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { connect, createServer } from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -40,13 +50,18 @@ const THINKING = flag("thinking", "low");
 const BRIDGE = flag("bridge", REPO);
 const PI = flag("pi", "pi");
 const OUT = flag("out") ?? mkdtempSync(join(tmpdir(), "abort-fork-"));
+const ROUNDS = Number(flag("rounds", "8"));
+const RESTART = args.includes("--restart");
+const SESSION_ID = randomUUID();
 
 const BILLING_HEADER = "x-anthropic-billing-header";
 
 const PLAN = [
 	{ tag: "[P1]", text: "Use the read tool to read notes-a.txt and notes-b.txt. Issue both read calls in a single message. Then reply with just the two codewords." },
 	{ tag: "[P2]", text: "Use the bash tool to run: ls -1 | wc -l. Reply with just the number." },
-	{ tag: "[P3]", abort: true, text: "Use the bash tool to run: sleep 45. Then reply with just: slept." },
+	{ tag: "[P3]", abort: true, text: ROUNDS > 0
+		? `Use the bash tool to run these commands one at a time: one tool call per message, and wait for each result before the next call. ${Array.from({ length: ROUNDS }, (_, i) => `echo r${i + 1}`).join(", ")}, then sleep 45. Then reply with just: slept.`
+		: "Use the bash tool to run: sleep 45. Then reply with just: slept." },
 	{ tag: "[P4]", text: "Use the bash tool to run: cat notes-b.txt. Reply with just its contents." },
 	{ tag: "[P5]", text: "Reply with just: ok." },
 ];
@@ -75,48 +90,68 @@ async function waitForPort(port) {
 	throw new Error(`capture proxy did not listen on ${port}`);
 }
 
-/** Drive pi over RPC: one prompt at a time, waiting for agent_settled. */
-async function drive(cwd, env, log) {
-	const pi = spawn(PI, ["--mode", "rpc", "--no-session", "-ne", "-e", BRIDGE, "--model", MODEL,
+/** One pi process in RPC mode. With --restart it keeps a session, so the next
+ *  process can continue it. */
+function startPi(cwd, env, log) {
+	const session = RESTART ? ["--session-dir", join(OUT, "sessions"), "--session-id", SESSION_ID] : ["--no-session"];
+	const child = spawn(PI, ["--mode", "rpc", ...session, "-ne", "-e", BRIDGE, "--model", MODEL,
 		...(THINKING === "off" ? [] : ["--thinking", THINKING])], { cwd, env, stdio: ["pipe", "pipe", log] });
-	const send = (command) => pi.stdin.write(JSON.stringify(command) + "\n");
+	const pi = { child, onEvent: () => {}, exited: new Promise((resolve) => child.once("exit", resolve)) };
+	pi.send = (command) => child.stdin.write(JSON.stringify(command) + "\n");
 	let buffer = "";
-	let onEvent = () => {};
-	const exited = new Promise((resolve) => pi.once("exit", resolve));
-	pi.stdout.on("data", (chunk) => {
+	child.stdout.on("data", (chunk) => {
 		buffer += chunk;
 		let nl;
 		while ((nl = buffer.indexOf("\n")) !== -1) {
 			const line = buffer.slice(0, nl).trim();
 			buffer = buffer.slice(nl + 1);
 			if (!line) continue;
-			try { onEvent(JSON.parse(line)); } catch { /* not JSON */ }
+			try { pi.onEvent(JSON.parse(line)); } catch { /* not JSON */ }
 		}
 	});
+	return pi;
+}
+
+/** Drive pi over RPC: one prompt at a time, waiting for agent_settled. The abort
+ *  step either sends an abort, or with --restart kills pi and starts a new one. */
+async function drive(cwd, env, log) {
+	let pi = startPi(cwd, env, log);
 	const settled = [];
 	try {
 		for (const step of PLAN) {
+			const current = pi;
+			let killed = false;
 			const done = new Promise((resolve, reject) => {
 				const timer = setTimeout(() => reject(new Error(`${step.tag} did not settle in 5 minutes`)), 5 * 60_000);
 				let aborting = false;
-				onEvent = (event) => {
+				current.onEvent = (event) => {
 					if (step.abort && !aborting && event.type === "tool_execution_start" && String(event.args?.command ?? "").includes("sleep")) {
 						aborting = true;
-						setTimeout(() => send({ type: "abort" }), 3000);
+						setTimeout(() => {
+							if (!RESTART) return current.send({ type: "abort" });
+							killed = true;
+							current.child.kill();
+							clearTimeout(timer);
+							resolve({ aborted: true });
+						}, 3000);
 					}
 					if (event.type === "agent_settled") {
 						clearTimeout(timer);
 						resolve(event);
 					}
 				};
-				exited.then((code) => reject(new Error(`pi exited ${code} during ${step.tag}`)));
+				current.exited.then((code) => killed || reject(new Error(`pi exited ${code} during ${step.tag}`)));
 			});
-			send({ type: "prompt", message: `${step.tag} ${step.text}` });
-			settled.push({ tag: step.tag, aborted: (await done).aborted });
+			current.send({ type: "prompt", message: `${step.tag} ${step.text}` });
+			settled.push({ tag: step.tag, aborted: (await done).aborted, ...(killed ? { restarted: true } : {}) });
+			if (killed) {
+				await current.exited;
+				pi = startPi(cwd, env, log);
+			}
 		}
 	} finally {
-		pi.stdin.end();
-		pi.kill();
+		pi.child.stdin.end();
+		pi.child.kill();
 	}
 	return settled;
 }
@@ -192,7 +227,7 @@ mkdirSync(cwd, { recursive: true });
 const word = () => `${["amber", "cobalt", "saffron", "teal"][Math.floor(Math.random() * 4)]}${Math.random().toString(36).slice(2, 6)}`;
 writeFileSync(join(cwd, "notes-a.txt"), `codeword: ${word()}\n`);
 writeFileSync(join(cwd, "notes-b.txt"), `codeword: ${word()}\n`);
-console.log(`model ${MODEL}, thinking ${THINKING}, bridge ${BRIDGE}, output ${OUT}`);
+console.log(`model ${MODEL}, thinking ${THINKING}, rounds ${ROUNDS}${RESTART ? ", restart" : ""}, bridge ${BRIDGE}, output ${OUT}`);
 
 const port = await freePort();
 const proxyLog = openSync(join(OUT, "proxy.log"), "w");
@@ -206,12 +241,14 @@ try {
 } finally {
 	proxy.kill();
 	closeSync(proxyLog);
+	// The bridge keeps a record of the pi session in the real agent dir.
+	if (RESTART) rmSync(join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "claude-bridge-sessions", `${SESSION_ID}.json`), { force: true });
 	closeSync(piErr);
 }
 
 const paths = syncPaths(debugLog);
 const requests = loadRequests(captureDir);
-console.log(`settled: ${settled.map((s) => `${s.tag}${s.aborted ? " (aborted)" : ""}`).join(", ")}`);
+console.log(`settled: ${settled.map((s) => `${s.tag}${s.restarted ? " (killed, restarted)" : s.aborted ? " (aborted)" : ""}`).join(", ")}`);
 console.log(`sync paths: ${paths.join(", ")}`);
 console.log(`${requests.length} main-loop requests\n`);
 
@@ -230,4 +267,4 @@ for (const tag of ["[P4]", "[P5]"]) {
 		? `      prefix identical for all ${d.of} elements`
 		: `      first change at element ${d.at} of ${d.of}: ${d.label}\n        before: ${d.before}\n        after:  ${d.after}`);
 }
-writeFileSync(join(OUT, "report.json"), JSON.stringify({ model: MODEL, thinking: THINKING, bridge: BRIDGE, settled, paths, requests: requests.map((r) => ({ n: r.n, usage: r.usage })) }, null, 1));
+writeFileSync(join(OUT, "report.json"), JSON.stringify({ model: MODEL, thinking: THINKING, rounds: ROUNDS, restart: RESTART, bridge: BRIDGE, settled, paths, requests: requests.map((r) => ({ n: r.n, usage: r.usage })) }, null, 1));

@@ -6,11 +6,11 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createSession, openSession } from "cc-session-io";
-import { forkSessionPrefix, historyFingerprint } from "../src/session-fork.js";
+import { forkSessionPrefix, historyFingerprint, liveExtent } from "../src/session-fork.js";
 
 const { __test } = await import("../src/index.js");
 
@@ -91,6 +91,119 @@ describe("forkSessionPrefix", () => {
 	});
 });
 
+// --- An aborted query with tool rounds, as Claude Code writes it ---
+//
+// CC writes one assistant record per content block, all with the API message
+// id, then one user record per tool result, then attachments such as the
+// total_tokens_reminder. pi holds one assistant message per response and one
+// toolResult per call.
+
+const piUser = (text) => ({ role: "user", content: text, timestamp: T });
+const piCall = (...ids) => ({ role: "assistant", content: [{ type: "thinking", thinking: "hm", thinkingSignature: "sig" }, ...ids.map((id) => ({ type: "toolCall", id, name: "bash", arguments: {} }))], provider: "claude-bridge", stopReason: "toolUse", timestamp: T });
+const piResult = (id) => ({ role: "toolResult", toolCallId: id, toolName: "bash", content: [{ type: "text", text: `out ${id}` }], isError: false, timestamp: T });
+
+/** Raw CC records for a query, chained by uuid; `end` marks a cut. */
+function ccLog(sessionId, parent = null) {
+	const lines = [];
+	let n = 0;
+	const push = (record) => {
+		const uuid = randomUUID();
+		lines.push(JSON.stringify({ parentUuid: parent, uuid, sessionId, timestamp: new Date(T + n++).toISOString(), ...record }));
+		parent = uuid;
+	};
+	const log = {
+		lines,
+		prompt(text) { push({ type: "user", message: { role: "user", content: text } }); return log; },
+		synthetic(text) { push({ type: "assistant", message: { id: randomUUID(), model: "<synthetic>", role: "assistant", content: [{ type: "text", text }] } }); return log; },
+		response(...ids) {
+			const id = `msg_${randomUUID()}`;
+			push({ type: "assistant", message: { id, role: "assistant", content: [{ type: "thinking", thinking: "hm", signature: "sig" }] } });
+			for (const tool of ids) push({ type: "assistant", message: { id, role: "assistant", content: [{ type: "tool_use", id: tool, name: "mcp__custom-tools__bash", input: {} }] } });
+			return log;
+		},
+		result(id) { push({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: `out ${id}` }] } }); return log; },
+		attachment(attachment) { push({ type: "attachment", attachment }); return log; },
+		reminder() { return log.attachment({ type: "total_tokens_reminder" }); },
+		bookkeeping(type) { lines.push(JSON.stringify({ type, sessionId })); return log; },
+		interrupt() { push({ type: "user", message: { role: "user", content: [{ type: "text", text: "[Request interrupted by user]" }] } }); return log; },
+		get text() { return lines.map((l) => l + "\n").join(""); },
+	};
+	return log;
+}
+
+/** The byte offset after the first `count` lines of `log`. */
+const bytesAfter = (log, count) => Buffer.byteLength(log.lines.slice(0, count).map((l) => l + "\n").join(""));
+
+describe("liveExtent", () => {
+	const sid = "s";
+
+	it("keeps every round pi holds in full, and stops at a call without its result", () => {
+		const log = ccLog(sid).prompt("Go").reminder()
+			.response("a").result("a").reminder()
+			.response("b").result("b").reminder();
+		const kept = log.lines.length;
+		log.bookkeeping("last-prompt").response("c"); // the process died running c
+		const pi = [piUser("Go"), piCall("a"), piResult("a"), piCall("b"), piResult("b"), piCall("c")];
+
+		assert.deepEqual(liveExtent(Buffer.from(log.text), 0, pi), { bytes: bytesAfter(log, kept), piMessages: 5 });
+	});
+
+	it("cuts before the interrupt marker an abort writes", () => {
+		const log = ccLog(sid).prompt("Go").response("a").result("a").reminder();
+		const kept = log.lines.length;
+		log.bookkeeping("mode").interrupt();
+		const pi = [piUser("Go"), piCall("a"), piResult("a"), { role: "assistant", content: [], provider: "claude-bridge", stopReason: "aborted", timestamp: T }];
+
+		assert.deepEqual(liveExtent(Buffer.from(log.text), 0, pi), { bytes: bytesAfter(log, kept), piMessages: 3 });
+	});
+
+	it("starts at the given offset and skips CC's synthetic reply before the prompt", () => {
+		const before = ccLog(sid).prompt("Earlier").response("x").result("x");
+		const log = ccLog(sid).synthetic("No response requested.").prompt("Go").response("a").result("a").reminder();
+		const start = Buffer.byteLength(before.text);
+		const source = Buffer.from(before.text + log.text);
+
+		assert.deepEqual(liveExtent(source, start, [piUser("Go"), piCall("a"), piResult("a")]), { bytes: source.length, piMessages: 3 });
+	});
+
+	it("needs every result of a parallel call on both sides", () => {
+		const log = ccLog(sid).prompt("Go").response("a", "b").result("a").result("b").reminder();
+		const source = Buffer.from(log.text);
+
+		assert.equal(liveExtent(source, 0, [piUser("Go"), piCall("a", "b"), piResult("b"), piResult("a")]).piMessages, 4, "order does not matter");
+		assert.equal(liveExtent(source, 0, [piUser("Go"), piCall("a", "b"), piResult("a")]).piMessages, 0, "pi lacks b's result");
+		const ccLacksB = ccLog(sid).prompt("Go").response("a", "b").result("a");
+		assert.equal(liveExtent(Buffer.from(ccLacksB.text), 0, [piUser("Go"), piCall("a", "b"), piResult("a"), piResult("b")]).piMessages, 0, "CC lacks b's result");
+	});
+
+	it("keeps a round with a steer only when CC drained the same steer", () => {
+		const log = ccLog(sid).prompt("Go")
+			.response("a").result("a").reminder()
+			.response("b").bookkeeping("queue-operation").result("b")
+			.attachment({ type: "queued_command", prompt: [{ type: "text", text: "also check y" }] }).reminder()
+			.response("c").result("c");
+		const source = Buffer.from(log.text);
+		const pi = (steer) => [piUser("Go"), piCall("a"), piResult("a"), piCall("b"), piResult("b"), piUser(steer), piCall("c"), piResult("c")];
+
+		assert.deepEqual(liveExtent(source, 0, pi("also check y")), { bytes: source.length, piMessages: 8 });
+		assert.equal(liveExtent(source, 0, pi("something else")).piMessages, 3, "a different steer stops before its round");
+		const undelivered = [piUser("Go"), piCall("a"), piResult("a"), piUser("never reached CC"), piCall("b"), piResult("b")];
+		assert.equal(liveExtent(Buffer.from(ccLog(sid).prompt("Go").response("a").result("a").response("b").result("b").text), 0, undelivered).piMessages, 0);
+	});
+
+	it("stops at calls pi does not hold, a response without calls, and a partial line", () => {
+		const log = ccLog(sid).prompt("Go").response("a").result("a");
+		const source = Buffer.from(log.text);
+		assert.equal(liveExtent(source, 0, [piUser("Go"), piCall("z"), piResult("z")]).piMessages, 0, "other ids");
+		assert.equal(liveExtent(source, 0, [piCall("a"), piResult("a")]).piMessages, 0, "no prompt on pi's side");
+		const cut = Buffer.from(log.text.slice(0, -20));
+		assert.equal(liveExtent(cut, 0, [piUser("Go"), piCall("a"), piResult("a")]).piMessages, 0, "the result line is incomplete");
+		const text = ccLog(sid).prompt("Go");
+		text.lines.push(JSON.stringify({ type: "assistant", uuid: randomUUID(), message: { id: "m", role: "assistant", content: [{ type: "text", text: "Done" }] } }));
+		assert.equal(liveExtent(Buffer.from(text.text), 0, [piUser("Go"), { role: "assistant", content: [{ type: "text", text: "Done" }] }]).piMessages, 0);
+	});
+});
+
 describe("syncSharedSession after an abort", () => {
 	afterEach(() => __test.resetSharedSession());
 
@@ -123,6 +236,40 @@ describe("syncSharedSession after an abort", () => {
 				['user:"Hi"', "attachment:date", 'assistant:[{"type":"text","text":"Hello."}]', 'user:"Do X"', 'assistant:[{"type":"text","text":"Starting X"}]'],
 				"CC's own records stay, pi's aborted turn follows",
 			);
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps the aborted query's live rounds and appends only what follows them", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "session-fork-"));
+		try {
+			const src = seedAbortedSession(cwd);
+			// Replace seedAbortedSession's aborted turn with a live query of two rounds.
+			const full = readFileSync(src.jsonlPath);
+			writeFileSync(src.jsonlPath, full.subarray(0, src.bytes));
+			const leaf = chain(openSession({ sessionId: src.sessionId, projectPath: cwd }).records).at(-1).uuid;
+			const log = ccLog(src.sessionId, leaf).prompt("Do X").response("a").result("a").reminder().response("b").result("b").reminder();
+			log.response("c").interrupt();
+			appendFileSync(src.jsonlPath, log.text);
+			arm(cwd, src, [hi, hello]);
+
+			const aborted = { role: "assistant", content: [], provider: "claude-bridge", stopReason: "aborted", timestamp: T };
+			const history = [hi, hello, doX, piCall("a"), piResult("a"), piCall("b"), piResult("b"), piCall("c"), aborted, { role: "user", content: "Next", timestamp: T + 4 }];
+			const result = __test.syncSharedSession(history, cwd);
+
+			assert.equal(__test.getSharedSession(null).cursor, 9);
+			const forked = openSession({ sessionId: result.sessionId, projectPath: cwd });
+			const describe = (r) => r.type === "attachment" ? `attachment:${r.attachment.type}`
+				: `${r.type}:${r.message.content.map?.((b) => b.type).join("+") ?? "text"}`;
+			assert.deepEqual(chain(forked.records).slice(3).map(describe), [
+				"user:text",
+				"assistant:thinking", "assistant:tool_use", "user:tool_result", "attachment:total_tokens_reminder",
+				"assistant:thinking", "assistant:tool_use", "user:tool_result", "attachment:total_tokens_reminder",
+				"assistant:thinking+tool_use", "user:tool_result",
+			], "CC's two live rounds stay, with their attachments; pi appends only c, paired with a result");
+			const live = forked.records.filter((r) => r.type === "assistant" && String(r.message.id).startsWith("msg_") && !String(r.message.id).startsWith("msg_syn"));
+			assert.equal(live.length, 4, "the kept rounds keep CC's own message ids");
 		} finally {
 			rmSync(cwd, { recursive: true, force: true });
 		}

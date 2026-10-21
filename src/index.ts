@@ -12,7 +12,7 @@ import { debugLogPath, diagLogPath } from "./log-paths.js";
 import { applyLongContext, buildModels, claudeCodeModelId, resolveClaudeCodeRuntimeModel, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
-import { forkSessionPrefix, historyFingerprint, type ForkPoint } from "./session-fork.js";
+import { forkSessionPrefix, historyFingerprint, liveExtent, type ForkPoint, type LiveExtent } from "./session-fork.js";
 import { deleteSessionRecord, pruneSessionRecords, readSessionRecord, sessionFileExists, sessionRecordDir, writeSessionRecord } from "./session-record.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, ctx } from "./query-state.js";
@@ -1240,10 +1240,10 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	return { sessionId: session.sessionId };
 }
 
-/** Cut the aborted query's session file back to where the query started, and
- *  append pi's record of the aborted turn. Null when pi's history no longer
- *  starts with what the file holds, or the file cannot be cut: the caller then
- *  rebuilds as before. */
+/** Cut the aborted query's session file back to the last tool round pi also
+ *  holds (at the latest, where the query started), and append pi's record of the
+ *  rest of the turn. Null when pi's history no longer starts with what the file
+ *  holds, or the file cannot be cut: the caller then rebuilds as before. */
 function syncFromForkPoint(
 	point: ForkPoint & { cwd: string },
 	priorMessages: Context["messages"],
@@ -1261,19 +1261,24 @@ function syncFromForkPoint(
 		debug(`${label}: pi history no longer starts with the ${point.piTurnStart} messages the file holds, rebuilding instead`);
 		return null;
 	}
+	const claudeDir = process.env.CLAUDE_CONFIG_DIR;
 	let session: ReturnType<typeof forkSessionPrefix>;
+	let live: LiveExtent;
 	try {
-		session = forkSessionPrefix({ sourceSessionId: point.sessionId, bytes: point.bytes, cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR, model: modelId });
+		const source = readFileSync(getSessionPath(point.sessionId, normalizeProjectPath(cwd), claudeDir));
+		live = liveExtent(source, point.bytes, priorMessages.slice(point.piTurnStart));
+		session = forkSessionPrefix({ sourceSessionId: point.sessionId, bytes: live.bytes, cwd, claudeDir, model: modelId });
 	} catch (error) {
 		debug(`${label}: could not cut the session file, rebuilding instead:`, error);
 		return null;
 	}
 	const prefixRecords = session.records.length;
-	convertAndImportMessages(session, priorMessages.slice(point.piTurnStart), customToolNameToSdk);
+	const piKept = point.piTurnStart + live.piMessages;
+	convertAndImportMessages(session, priorMessages.slice(piKept), customToolNameToSdk);
 	session.save();
 	verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd);
 	setSessionStateFor(piSessionId, { sessionId: session.sessionId, cursor: priorMessages.length, cwd, piSessionId: piSessionId ?? undefined });
-	debug(`Case 5 post-abort fork: ${label} → new session ${session.sessionId.slice(0, 8)}, ${prefixRecords} records kept + ${session.records.length - prefixRecords} for ${priorMessages.length - point.piTurnStart} pi messages`);
+	debug(`Case 5 post-abort fork: ${label} → new session ${session.sessionId.slice(0, 8)}, ${prefixRecords} records kept (${live.bytes - point.bytes} bytes, ${live.piMessages} pi messages of the aborted query) + ${session.records.length - prefixRecords} for ${priorMessages.length - piKept} pi messages`);
 	debugSessionPaths(`${session.sessionId.slice(0, 8)}`, cwd, session.jsonlPath);
 	debug(`syncResult: path=fork sessionId=${session.sessionId} priors=${priorMessages.length}`);
 	return { sessionId: session.sessionId };
