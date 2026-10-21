@@ -8,6 +8,13 @@
 // history it sent. Copying that prefix keeps the cached request byte-identical up
 // to the aborted turn (diag/probe-fork-fidelity.mjs).
 //
+// The cut does not stop where the aborted query started. It keeps every tool
+// round of that query which pi also holds in full (liveExtent). A rebuilt round
+// differs from the live one: it lacks CC's hidden attachments, and the API drops
+// thinking blocks whose prefix changed. The API also finds a cached prefix only
+// about 20 content blocks back from a request's cache breakpoint. So a long
+// query that pi re-appends from its start misses the whole conversation.
+//
 // Cached compaction summaries (cached-summary.ts) use the same copy: they resume
 // it so the summary request reads the conversation from the prompt cache.
 //
@@ -52,6 +59,110 @@ export function historyFingerprint(history: readonly unknown[], length: number):
 const UUID_FIELDS = ["uuid", "parentUuid", "logicalParentUuid", "sourceToolAssistantUUID", "leafUuid", "messageId"];
 
 const isChainRecord = (r: JsonlRecord) => r.type === "user" || r.type === "assistant" || r.type === "attachment";
+
+/** How much of an aborted query's live session file can stay. */
+export interface LiveExtent {
+	/** Where to cut the file: at or after the query's start. */
+	bytes: number;
+	/** How many of pi's messages from the query's start those bytes hold. */
+	piMessages: number;
+}
+
+type Block = { type?: string; id?: string; tool_use_id?: string; text?: string };
+type PiMessage = { role?: string; content?: unknown; toolCallId?: string };
+
+const blocksOf = (content: unknown): Block[] => (Array.isArray(content) ? content : []);
+
+/** A user turn as text, images as markers: how a steer is compared across the two sides. */
+function promptText(content: unknown): string {
+	if (typeof content === "string") return content;
+	return blocksOf(content).map((b) => (b.type === "text" ? b.text ?? "" : `[${b.type}]`)).join("\n");
+}
+
+/**
+ * Walk the records an aborted query wrote after `start` and match them, one tool
+ * round at a time, to pi's messages from the query's start (`piTail`). A round is
+ * one API response with tool calls, its tool results, and the attachments CC wrote
+ * with them. It matches when pi holds the same calls (by id) and all their results,
+ * and the same steers CC drained as `queued_command` attachments.
+ *
+ * Returns the end of the last round that matched, or `start` when none did. The
+ * walk stops at anything else: a response without tool calls, a missing result,
+ * the interrupt marker CC writes on abort, a partial line.
+ */
+export function liveExtent(source: Buffer, start: number, piTail: readonly unknown[]): LiveExtent {
+	const none: LiveExtent = { bytes: start, piMessages: 0 };
+	const tail = piTail as readonly PiMessage[];
+
+	// Chain records after `start`, with where each line ends. A cut after a record
+	// keeps the bookkeeping lines (queue operations, last-prompt) before it.
+	const records: { record: JsonlRecord; end: number }[] = [];
+	let offset = start;
+	while (offset < source.length) {
+		const nl = source.indexOf(0x0a, offset);
+		if (nl === -1) break;
+		const line = source.subarray(offset, nl).toString("utf8").trim();
+		offset = nl + 1;
+		if (!line) continue;
+		let record: JsonlRecord;
+		try {
+			record = JSON.parse(line) as JsonlRecord;
+		} catch {
+			break;
+		}
+		if (isChainRecord(record)) records.push({ record, end: offset });
+	}
+	const message = (r: JsonlRecord) => (r as { message?: { id?: string; model?: string; content?: unknown } }).message;
+	const isToolResults = (r: JsonlRecord) => r.type === "user" && blocksOf(message(r)?.content).some((b) => b.type === "tool_result");
+
+	// The query's prompt: pi's leading user messages, CC's first user record and
+	// the attachments CC wrote with it. A resumed file that ended on a user record
+	// gets CC's own "No response requested." before the prompt.
+	let p = 0;
+	while (p < tail.length && tail[p].role === "user") p++;
+	let k = 0;
+	while (records[k]?.record.type === "assistant" && message(records[k].record)?.model === "<synthetic>") k++;
+	if (p === 0 || records[k]?.record.type !== "user" || isToolResults(records[k].record)) return none;
+	k++;
+	while (records[k]?.record.type === "attachment") k++;
+
+	let extent = none;
+	while (records[k]?.record.type === "assistant") {
+		// The response: CC writes one record per content block.
+		const id = message(records[k].record)?.id;
+		const calls: string[] = [];
+		for (; records[k]?.record.type === "assistant" && message(records[k].record)?.id === id; k++) {
+			for (const b of blocksOf(message(records[k].record)?.content)) if (b.type === "tool_use" && b.id) calls.push(b.id);
+		}
+		const piCalls = tail[p]?.role === "assistant" ? blocksOf(tail[p].content).filter((b) => b.type === "toolCall").map((b) => b.id) : [];
+		if (calls.length === 0 || piCalls.join("\n") !== calls.join("\n")) break;
+
+		// CC's side of the results: tool results and attachments, steers among them.
+		const results = new Set<string>();
+		const steers: string[] = [];
+		let end = -1;
+		for (; records[k] && (records[k].record.type === "attachment" || isToolResults(records[k].record)); k++) {
+			const { record } = records[k];
+			if (record.type === "user") for (const b of blocksOf(message(record)?.content)) if (b.tool_use_id) results.add(b.tool_use_id);
+			const attachment = (record as { attachment?: { type?: string; prompt?: unknown } }).attachment;
+			if (attachment?.type === "queued_command") steers.push(promptText(attachment.prompt));
+			end = records[k].end;
+		}
+		// pi's side: the results, then any steers.
+		const piResults = new Set<string>();
+		const piSteers: string[] = [];
+		let q = p + 1;
+		for (; tail[q]?.role === "toolResult" || tail[q]?.role === "user"; q++) {
+			if (tail[q].role === "toolResult") piResults.add(tail[q].toolCallId ?? "");
+			else piSteers.push(promptText(tail[q].content));
+		}
+		const answered = (ids: Set<string>) => ids.size === calls.length && calls.every((c) => ids.has(c));
+		if (!answered(results) || !answered(piResults) || steers.join("\n") !== piSteers.join("\n")) break;
+		extent = { bytes: end, piMessages: q };
+		p = q;
+	}
+	return extent;
+}
 
 /**
  * Copy the first `bytes` of a CC session file into a new session and open it for

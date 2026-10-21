@@ -10,8 +10,8 @@
 // Two kinds of record:
 //   "start"    — written before each query. The file size and the pi history it
 //                mirrors at that point: the same data as an abort's fork point.
-//                The next process cuts the file back to that size and appends
-//                pi's copy of the turn, as after an abort.
+//                The next process cuts the file back to the last tool round pi
+//                also holds and appends pi's copy of the rest, as after an abort.
 //   "complete" — written when a query ends normally. The file then holds pi's
 //                history up to `cursor` plus the answer pi appends next, so the
 //                next process resumes it as is.
