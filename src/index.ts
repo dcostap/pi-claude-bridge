@@ -2372,7 +2372,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	if (resultCtx) {
 		claimCurrentPiStream(stream, "tool-result", resultCtx, options);
 		resultCtx.resetTurnState(model);
-		resultCtx.bindRunSignal?.(options?.signal);
+		resultCtx.bindRunSignal?.(options?.signal, stream);
 		// A rewrite that armed the mark after this query parked gets copied here,
 		// though markRebuildForSession usually reaches it directly.
 		if (!resultCtx.historyStale && resultCtx.piSessionId && historyRewrittenBySession.has(resultCtx.piSessionId)) {
@@ -2670,18 +2670,18 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		else options.signal.addEventListener("abort", onAbort, { once: true });
 	}
 	// A later run continuing this query from a tool result brings its own signal;
-	// only the latest one is bound, and it is unbound when the query ends.
-	let runSignal: AbortSignal | undefined;
-	const unbindRunSignal = () => {
-		if (runSignal !== options?.signal) runSignal?.removeEventListener("abort", onAbort);
-		runSignal = undefined;
-	};
-	const bindRunSignal = (signal: AbortSignal | undefined) => {
+	// only the latest one is bound, and it is unbound when the query ends. Its abort
+	// counts only while that run's stream is live: hosts that abort each request's
+	// signal after it ends would otherwise kill the query parked at the next tool call.
+	let unbindRunSignal = () => {};
+	const bindRunSignal = (signal: AbortSignal | undefined, runStream: AssistantMessageEventStream) => {
 		unbindRunSignal();
+		unbindRunSignal = () => {};
 		if (!signal || signal === options?.signal) return;
-		runSignal = signal;
-		if (signal.aborted) onAbort();
-		else signal.addEventListener("abort", onAbort, { once: true });
+		const onRunAbort = () => { if (!completedStreams.has(runStream as object)) onAbort(); };
+		if (signal.aborted) return onRunAbort();
+		signal.addEventListener("abort", onRunAbort, { once: true });
+		unbindRunSignal = () => signal.removeEventListener("abort", onRunAbort);
 	};
 	queryCtx.bindRunSignal = bindRunSignal;
 

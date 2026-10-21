@@ -74,12 +74,12 @@ beforeEach(() => {
 
 afterEach(() => setQuery(null));
 
-async function parkThenContinue(secondSignal) {
+async function parkThenContinue(secondSignal, sid = "pi-continued") {
 	const ask = user("read a");
-	const parked = await streamSimple(model, { messages: [ask], tools }, { sessionId: "pi-continued", signal: new AbortController().signal }).result();
+	const parked = await streamSimple(model, { messages: [ask], tools }, { sessionId: sid, signal: new AbortController().signal }).result();
 	assert.equal(parked.stopReason, "toolUse");
 	return streamSimple(model, { messages: [ask, parked, toolResult("toolu_1"), user("write an essay")], tools },
-		{ sessionId: "pi-continued", signal: secondSignal });
+		{ sessionId: sid, signal: secondSignal });
 }
 
 describe("abort on a run that continues a parked query", () => {
@@ -103,5 +103,32 @@ describe("abort on a run that continues a parked query", () => {
 
 		assert.notEqual(reply, "timeout", "the abort ends the turn");
 		assert.equal(reply.stopReason, "aborted");
+	});
+
+	// Hosts that abort each request's signal once it ends (omp) must not kill the
+	// query that run left parked at its own tool call.
+	it("ignores the abort once that run has ended at the next tool call", async () => {
+		setQuery(({ prompt }) => {
+			const gen = (async function* () {
+				await prompt[Symbol.asyncIterator]().next();
+				yield init;
+				for (const step of toolUse("toolu_1")) yield step;
+				await settle(); // the second run picks up the query
+				for (const step of toolUse("toolu_2")) yield step;
+				await new Promise(() => {});
+			})();
+			gen.interrupt = async () => {};
+			gen.close = () => { closes++; };
+			return gen;
+		});
+		const controller = new AbortController();
+		const second = await (await parkThenContinue(controller.signal, "pi-continued-2")).result();
+		assert.equal(second.stopReason, "toolUse");
+		assert.equal(second.content.find((b) => b.type === "toolCall")?.id, "toolu_2");
+
+		controller.abort();
+		await settle();
+
+		assert.equal(closes, 0, "the parked query survives");
 	});
 });
