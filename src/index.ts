@@ -75,9 +75,14 @@ const DEBUG = process.env.CLAUDE_BRIDGE_DEBUG === "1";
 //   out of a pi session, which serves its own tools.
 // - DISABLE_AUTO_COMPACT=1: pi owns compaction; CC compacting its own copy would
 //   diverge from pi's history, which is the source of truth for every rebuild.
+// - CLAUDE_CODE_ELEGANT_MEADOW=0: stop CC (2.1.308+) logging every API request
+//   into its session file (`api-request`, `api-request-shape`, `api-request-blob`
+//   records). CC never reads them back to build a request; they only make the
+//   file about a third larger.
 const CC_CHILD_ENV = {
 	ENABLE_CLAUDEAI_MCP_SERVERS: "0",
 	DISABLE_AUTO_COMPACT: "1",
+	CLAUDE_CODE_ELEGANT_MEADOW: "0",
 } as const;
 
 // Pi owns context files on the provider path, so Claude Code must not load its
