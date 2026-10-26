@@ -2812,7 +2812,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			}
 			promptStream.fail(error instanceof Error ? error : new Error(String(error)));
 			if (queryCtx.turnOutput && queryCtx.currentPiStream) {
-				queryCtx.turnOutput.stopReason = options?.signal?.aborted ? "aborted" : "error";
+				queryCtx.turnOutput.stopReason = wasAborted || options?.signal?.aborted ? "aborted" : "error";
 				// The SDK drops its copy of the result text if any message follows the error
 				// result, so prefer the cause consumeQuery recorded off the result itself.
 				queryCtx.turnOutput.errorMessage ??= error instanceof Error ? error.message : String(error);

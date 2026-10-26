@@ -105,6 +105,34 @@ describe("abort on a run that continues a parked query", () => {
 		assert.equal(reply.stopReason, "aborted");
 	});
 
+	// A killed CLI can make the SDK throw. The opening run's signal is not aborted,
+	// so the turn must still report the abort, not an error.
+	it("reports an abort when the killed query throws", async () => {
+		setQuery(({ prompt }) => {
+			let onClose;
+			const killed = new Promise((r) => { onClose = r; });
+			const gen = (async function* () {
+				await prompt[Symbol.asyncIterator]().next();
+				yield init;
+				for (const step of toolUse("toolu_1")) yield step;
+				for (const step of textStart) yield step;
+				await killed;
+				throw new Error("Claude Code process exited");
+			})();
+			gen.interrupt = async () => {};
+			gen.close = () => { closes++; onClose(); };
+			return gen;
+		});
+		const controller = new AbortController();
+		const second = await parkThenContinue(controller.signal, "pi-continued-throw");
+		await settle();
+		controller.abort();
+		const reply = await Promise.race([second.result(), new Promise((r) => setTimeout(() => r("timeout"), 1000))]);
+
+		assert.notEqual(reply, "timeout", "the abort ends the turn");
+		assert.equal(reply.stopReason, "aborted");
+	});
+
 	// Hosts that abort each request's signal once it ends (omp) must not kill the
 	// query that run left parked at its own tool call.
 	it("ignores the abort once that run has ended at the next tool call", async () => {
