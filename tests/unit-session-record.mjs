@@ -13,9 +13,9 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createSession, getSessionPath, normalizeProjectPath, openSession } from "cc-session-io";
 
 const claudeDir = mkdtempSync(join(tmpdir(), "claude-bridge-session-record-cc-"));
@@ -101,6 +101,15 @@ beforeEach(() => {
 
 afterEach(() => setQuery(null));
 
+/** What a move from `from` into this cwd leaves: the record and CC's file under `from`. */
+function movedFrom(piSession, id, from) {
+	const path = join(sessionRecordDir(), `${piSession}.json`);
+	writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf-8")), cwd: from }));
+	const old = getSessionPath(id, normalizeProjectPath(from), claudeDir);
+	mkdirSync(dirname(old), { recursive: true });
+	renameSync(ccPath(id), old);
+}
+
 /** Turn one of a pi session, ending normally on CC session `id`. */
 async function firstTurn(piSession, id) {
 	const u1 = user("hi");
@@ -168,7 +177,43 @@ describe("session records", () => {
 		assert.ok(calls[1].resume, "it rebuilds a file from pi's history");
 	});
 
-	it("rebuilds when the file is gone or the cwd changed", async () => {
+	it("a session moved from another cwd resumes a copy of its file", async () => {
+		const id = randomUUID();
+		const history = await firstTurn("pi-moved", id);
+		const before = readFileSync(ccPath(id), "utf-8");
+		movedFrom("pi-moved", id, join(cwd, "elsewhere"));
+		forgetSessionMirrors();
+
+		scripts.push(turn(id, "next", "done"));
+		await streamSimple(model, { messages: [...history, user("next")], tools: [] }, { sessionId: "pi-moved" }).result();
+
+		assert.equal(calls[1].resume, id, "it resumes the same session in the new cwd");
+		assert.ok(readFileSync(ccPath(id), "utf-8").startsWith(before), "the new cwd holds a copy of the file, not a rebuild");
+	});
+
+	it("a session moved during a query cuts its file into the new cwd", async () => {
+		const id = randomUUID();
+		const history = await firstTurn("pi-moved-cut", id);
+		const u2 = user("move");
+		scripts.push({ steps: [ccTurn(id, "move", "partial"), init(id), (killed) => killed] });
+		void streamSimple(model, { messages: [...history, u2], tools: [] }, { sessionId: "pi-moved-cut" });
+		await settle();
+		assert.equal(readSessionRecord("pi-moved-cut")?.kind, "start");
+		movedFrom("pi-moved-cut", id, join(cwd, "elsewhere"));
+		forgetSessionMirrors();
+		activeQueryContexts.clear();
+
+		scripts.push(turn(randomUUID(), "again", "ok"));
+		await streamSimple(model, { messages: [...history, u2, assistant("pi kept this"), user("again")], tools: [] }, { sessionId: "pi-moved-cut" }).result();
+
+		const forked = calls[2].resume;
+		assert.ok(forked && forked !== id, "the cut goes to a new file, like after an abort");
+		const copy = openSession({ sessionId: forked, projectPath: cwd, claudeDir });
+		assert.match(JSON.stringify(copy.messages[1]), /hello \[cc record\]/, "the copy in the new cwd keeps CC's own records");
+		assert.doesNotMatch(JSON.stringify(copy.messages), /partial/);
+	});
+
+	it("rebuilds when the file is gone", async () => {
 		const gone = randomUUID();
 		const history = await firstTurn("pi-gone", gone);
 		rmSync(ccPath(gone));
@@ -176,15 +221,6 @@ describe("session records", () => {
 		scripts.push(turn(randomUUID(), "next", "done"));
 		await streamSimple(model, { messages: [...history, user("next")], tools: [] }, { sessionId: "pi-gone" }).result();
 		assert.notEqual(calls[1].resume, gone);
-
-		const moved = randomUUID();
-		const history2 = await firstTurn("pi-moved", moved);
-		const path = join(sessionRecordDir(), "pi-moved.json");
-		writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf-8")), cwd: join(cwd, "elsewhere") }));
-		forgetSessionMirrors();
-		scripts.push(turn(randomUUID(), "next", "done"));
-		await streamSimple(model, { messages: [...history2, user("next")], tools: [] }, { sessionId: "pi-moved" }).result();
-		assert.notEqual(calls[3].resume, moved);
 	});
 
 	it("a query that fails removes the record", async () => {

@@ -5,7 +5,7 @@ import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@a
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, getSessionPath, normalizeProjectPath, openSession, repairToolPairing } from "cc-session-io";
-import { appendFileSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync } from "fs";
+import { appendFileSync, copyFileSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync } from "fs";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
 import { debugLogPath, diagLogPath } from "./log-paths.js";
@@ -1243,7 +1243,8 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 
 /** Cut the aborted query's session file back to the last tool round pi also
  *  holds (at the latest, where the query started), and append pi's record of the
- *  rest of the turn. Null when pi's history no longer starts with what the file
+ *  rest of the turn. A file from another cwd is cut into this cwd's project
+ *  directory. Null when pi's history no longer starts with what the file
  *  holds, or the file cannot be cut: the caller then rebuilds as before. */
 function syncFromForkPoint(
 	point: ForkPoint & { cwd: string },
@@ -1254,10 +1255,7 @@ function syncFromForkPoint(
 	piSessionId: string | null | undefined,
 ): SyncResult | null {
 	const label = `fork from ${point.sessionId.slice(0, 8)}@${point.bytes}`;
-	if (point.cwd !== cwd) {
-		debug(`${label}: cwd changed (${point.cwd} → ${cwd}), rebuilding instead`);
-		return null;
-	}
+	if (point.cwd !== cwd) debug(`${label}: cwd changed (${point.cwd} → ${cwd}), cutting the file into the new cwd`);
 	if (priorMessages.length < point.piTurnStart || historyFingerprint(priorMessages, point.piTurnStart) !== point.fingerprint) {
 		debug(`${label}: pi history no longer starts with the ${point.piTurnStart} messages the file holds, rebuilding instead`);
 		return null;
@@ -1266,9 +1264,12 @@ function syncFromForkPoint(
 	let session: ReturnType<typeof forkSessionPrefix>;
 	let live: LiveExtent;
 	try {
-		const source = readFileSync(getSessionPath(point.sessionId, normalizeProjectPath(cwd), claudeDir));
+		const source = readFileSync(getSessionPath(point.sessionId, normalizeProjectPath(point.cwd), claudeDir));
 		live = liveExtent(source, point.bytes, priorMessages.slice(point.piTurnStart));
-		session = forkSessionPrefix({ sourceSessionId: point.sessionId, bytes: live.bytes, cwd, claudeDir, model: modelId });
+		session = forkSessionPrefix({
+			sourceSessionId: point.sessionId, bytes: live.bytes, cwd, claudeDir, model: modelId,
+			...(point.cwd !== cwd ? { sourceCwd: point.cwd } : {}),
+		});
 	} catch (error) {
 		debug(`${label}: could not cut the session file, rebuilding instead:`, error);
 		return null;
@@ -1287,15 +1288,15 @@ function syncFromForkPoint(
 
 /** The mirror a session record describes, planted for `piSessionId`. Null, and
  *  nothing planted, when there is no record or it does not fit pi's history: the
- *  sync then rebuilds as for a first turn. */
+ *  sync then rebuilds as for a first turn.
+ *
+ *  A record from another cwd (the session moved, e.g. into a worktree) keeps its
+ *  file too: a rebuild would miss the prompt cache for the whole conversation.
+ *  See forkSessionPrefix for what the moved file keeps. */
 function restoreSessionState(piSessionId: string, priorMessages: Context["messages"], cwd: string): SessionState | null {
 	const record = readSessionRecord(piSessionId);
 	if (!record) return null;
 	const label = `restore: ${record.kind} record for ${record.sessionId.slice(0, 8)}`;
-	if (record.cwd !== cwd) {
-		debug(`${label}: cwd changed (${record.cwd} → ${cwd}), rebuilding instead`);
-		return null;
-	}
 	if (!sessionFileExists(record, process.env.CLAUDE_CONFIG_DIR)) {
 		debug(`${label}: session file is gone, rebuilding instead`);
 		return null;
@@ -1305,6 +1306,20 @@ function restoreSessionState(piSessionId: string, priorMessages: Context["messag
 		debug(`${label}: pi history no longer starts with the ${length} messages the file holds, rebuilding instead`);
 		return null;
 	}
+	// A query that ended normally has no process left to write the file: copy it
+	// as is. A cut (below) reads the file where it is.
+	if (record.kind === "complete" && record.cwd !== cwd) {
+		const claudeDir = process.env.CLAUDE_CONFIG_DIR;
+		const destination = getSessionPath(record.sessionId, normalizeProjectPath(cwd), claudeDir);
+		try {
+			mkdirSync(dirname(destination), { recursive: true });
+			copyFileSync(getSessionPath(record.sessionId, normalizeProjectPath(record.cwd), claudeDir), destination);
+		} catch (error) {
+			debug(`${label}: could not copy the file to ${cwd}, rebuilding instead:`, error);
+			return null;
+		}
+		debug(`${label}: cwd changed (${record.cwd} → ${cwd}), copied the file`);
+	}
 	const base: SessionState = { sessionId: record.sessionId, cursor: length, cwd, piSessionId };
 	// A start record means the query never ended normally: cut the file back to
 	// where it began, as after an abort. Rotate, since its process may still be alive.
@@ -1312,7 +1327,7 @@ function restoreSessionState(piSessionId: string, priorMessages: Context["messag
 		...base,
 		needsRebuild: true,
 		forceRotate: true,
-		forkPoint: { sessionId: record.sessionId, bytes: record.bytes, piTurnStart: record.piTurnStart, fingerprint: record.fingerprint, cwd },
+		forkPoint: { sessionId: record.sessionId, bytes: record.bytes, piTurnStart: record.piTurnStart, fingerprint: record.fingerprint, cwd: record.cwd },
 	};
 	setSessionStateFor(piSessionId, state);
 	debug(`${label}: ${record.kind === "complete" ? "resuming the file" : `cutting the file back to ${record.bytes} bytes`}, cursor=${length}`);

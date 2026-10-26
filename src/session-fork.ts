@@ -21,6 +21,11 @@
 // The copy takes fresh uuids, like the SDK's own forkSession: the killed CC
 // process may still append to the source file, and the copy must not share
 // record ids with it.
+//
+// The copy can go to another project directory, when the pi session moved to
+// another cwd. It keeps the recorded system prompt, which then carries the old
+// directory's project context until compaction. Claude Code appends the new
+// working directory itself. We chose the prompt cache over fresh instructions.
 
 import { createHash, randomUUID } from "crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "fs";
@@ -173,6 +178,8 @@ export function forkSessionPrefix(opts: {
 	sourceSessionId: string;
 	bytes: number;
 	cwd: string;
+	/** Where the source file lives, when it is not `cwd`. */
+	sourceCwd?: string;
 	claudeDir?: string;
 	model?: string;
 	/** prefixDigest the first `bytes` must have: guards against a file that was
@@ -180,7 +187,7 @@ export function forkSessionPrefix(opts: {
 	digest?: string;
 }): Session {
 	const projectPath = normalizeProjectPath(opts.cwd);
-	const sourcePath = getSessionPath(opts.sourceSessionId, projectPath, opts.claudeDir);
+	const sourcePath = getSessionPath(opts.sourceSessionId, normalizeProjectPath(opts.sourceCwd ?? opts.cwd), opts.claudeDir);
 	const source = readFileSync(sourcePath);
 	if (source.length < opts.bytes) {
 		throw new Error(`source session is ${source.length} bytes, expected at least ${opts.bytes}`);
@@ -221,7 +228,7 @@ export function forkSessionPrefix(opts: {
 		projectPath,
 		jsonlPath,
 		slug: first?.slug as string | undefined,
-		cwd: first?.cwd as string | undefined,
+		cwd: opts.sourceCwd === undefined ? first?.cwd as string | undefined : opts.cwd,
 		version: first?.version as string | undefined,
 		gitBranch: first?.gitBranch as string | undefined,
 		model: opts.model,
